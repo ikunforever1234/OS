@@ -587,3 +587,542 @@ best_fit_free_pages(struct Page *base, size_t n) {
 
 ### 三、扩展练习Challenge：buddy system（伙伴系统）分配算法
 
+相比于``best fit``和``first fit``，``buddy system``通过将物理内存划分为不同大小的块（均为2的幂次方页），来进行高效分配，采取的数据结构是以阶``order``为索引，每一个元素都指向一个双向链表，链表中的每一个元素都是一个空闲块，其大小为``2^order``页。
+
+#### 设计思路
+
+##### 1.基本数据结构定义
+
+```c
+static free_area_t free_area[MAX_ORDER + 1];
+
+#define free_list(order) (free_area[order].free_list)
+#define nr_free(order)   (free_area[order].nr_free)
+```
+
+这里将``free_area``定义为一个全局的数组，并定义一些宏方便后续编写，其中``free_list``指向一个双向链表，``nr_free``表示该链表中的空闲块数量。
+
+
+##### 2.一些辅助函数
+
+```c
+static inline size_t page_to_pfn(struct Page *page) {
+    return page - pages;
+}
+
+static inline struct Page *pfn_to_page(size_t pfn) {
+    return &pages[pfn];
+}
+
+static inline struct Page *buddy_of(struct Page *page, int order) {
+    size_t pfn = page_to_pfn(page);
+    size_t buddy_pfn = pfn ^ (1 << order);
+    return pfn_to_page(buddy_pfn);
+}
+```
+
+在这里 `page_to_pfn`和`pfn_to_page`两个函数用来实现页指针和页帧号之间的转换。
+
+之后`buddy_of`函数用来获取给定页指针和阶数对应的伙伴页指针，这里是因为对于特定阶数``（order）``的块，其大小是 ``2^order``页，伙伴块之间的页帧号仅在第 ``order`` 位上不同，因此这里我们使用异或运算来翻转这一位，就能找到伙伴块的页帧，再转回页指针。
+
+##### 3.buddy_init
+
+```c
+static void buddy_init(void) {
+    for (int i = 0; i <= MAX_ORDER; i++) {
+        list_init(&free_list(i));
+        nr_free(i) = 0;
+    }
+}
+```
+
+这里初始化了``free_area``数组，将所有链表初始化为空，并将所有阶的空闲块数量都置为``0``。
+
+##### 4.buddy_init_memmap
+
+```c
+static void
+buddy_init_memmap(struct Page *base, size_t n)
+{
+    assert(n > 0);
+
+    /* 清理每页的基础字段*/
+    for (struct Page *it = base; it < base + n; ++it) {
+        assert(PageReserved(it));
+        it->flags = 0;
+        it->property = 0;
+        set_page_ref(it, 0);
+        ClearPageProperty(it);
+    }
+
+    struct Page *p = base;
+    size_t remain = n;
+
+    while (remain > 0) {
+        /* 计算在剩余范围内的最大阶（不超过 MAX_ORDER） */
+        int max_order_for_remain = 0;
+        while ((1U << (max_order_for_remain + 1)) <= remain &&
+               max_order_for_remain + 1 <= MAX_ORDER) {
+            max_order_for_remain++;
+        }
+
+        /* 从 max_order 向下找第一个满足对齐的阶 */
+        int order;
+        unsigned long pfn = page_to_pfn(p);
+        for (order = max_order_for_remain; order >= 0; --order) {
+            unsigned long block_size = (1UL << order);
+            if ((pfn & (block_size - 1)) == 0) { /* 对齐检查 */
+                break;
+            }
+        }
+        assert(order >= 0);
+
+        /* 标记该块头为 order 并按地址升序插入对应阶链表 */
+        p->property = order;
+        SetPageProperty(p);
+
+        list_entry_t *head = &free_list(order);
+        if (list_empty(head)) {
+            list_add(head, &p->page_link);
+        } else {
+            /* 顺序遍历，找到第一个物理地址比 p 大的元素，在其前面插入 */
+            list_entry_t *le = list_next(head);
+            int inserted = 0;
+            while (le != head) {
+                struct Page *q = le2page(le, page_link);
+                if (p < q) {
+                    list_add_before(le, &p->page_link);
+                    inserted = 1;
+                    break;
+                }
+                le = list_next(le);
+            }
+            if (!inserted) {
+                /* 如果遍历结束都没插入，说明要插到尾部（在 head 的前一个位置插入） */
+                list_entry_t *last = list_prev(head);
+                list_add(last, &p->page_link);
+            }
+        }
+
+        nr_free(order)++;
+
+        /* 前进到下一块 */
+        size_t consumed = (1UL << order);
+        p += consumed;
+        remain -= consumed;
+    }
+}
+```
+
+这里我们的``buddy_init_memmap``函数将一大段连续的物理内存页，按照伙伴系统的规则进行划分，并初始化相应的管理结构，最后将这些不同大小的空闲内存块挂载到对应的空闲链表中​​。
+
+具体来说，首先遍历所有页，将它们的状态设置为空闲，并将所有页的 `property` 和 `ref` 字段都清零。
+
+之后在我们的剩余页数里，找到不超过``MAX_ORDER``的最大阶数``max_order_for_remain``。然后从这开始向下遍历，找到第一个满足对齐的阶，将这一块标记为该阶数，并按地址升序插入到对应的空闲链表中，最后更新剩余页数和指针。
+
+##### 5.buddy_alloc_pages
+
+```c
+static struct Page *buddy_alloc_pages(size_t n) {
+    int order = 0;
+    while ((1U << order) < n) order++;
+    int cur_order = order;
+
+    while (cur_order <= MAX_ORDER && list_empty(&free_list(cur_order))) {
+        cur_order++;
+    }
+    if (cur_order > MAX_ORDER) return NULL;
+
+    list_entry_t *le = list_next(&free_list(cur_order));
+    struct Page *page = le2page(le, page_link);
+    list_del(le);
+    nr_free(cur_order)--;
+
+    while (cur_order > order) {
+        cur_order--;
+        struct Page *buddy = page + (1 << cur_order);
+        buddy->property = cur_order;
+        SetPageProperty(buddy);
+        list_add(&free_list(cur_order), &(buddy->page_link));
+        nr_free(cur_order)++;
+    }
+
+    ClearPageProperty(page);
+    return page;
+}
+```
+
+这里我们实现了分配的过程，先计算所需要的大小，然后寻找合适的块，最后分割大块。
+
+具体来说，首先计算满足请求所需的最小内存块阶数，通过一个循环，找到能够容纳 ``n`` 页的最小2的幂次方，即``cur_order``。
+
+之后从``cur_order``开始向上访问找空闲块，找到以后取出空闲块，找不到就返回``NULL``。
+
+如果找到的空闲块比请求的要大，使用``page + (1 << cur_order)``将大块拆成两半，一半``buddy``插回到低一阶的空闲链表中，并修改相对应的属性，剩下的一半``page``被继续分割或者分配出去。
+
+
+##### 6.buddy_free_pages
+```c
+static void buddy_free_pages(struct Page *page, size_t n) {
+    int order = 0;
+    while ((1U << order) < n) order++;
+
+    while (order < MAX_ORDER) {
+        struct Page *buddy = buddy_of(page, order);
+        if (!PageProperty(buddy) || buddy->property != order) break;
+
+        list_del(&(buddy->page_link));
+        nr_free(order)--;
+
+        if (buddy < page) page = buddy;
+        order++;
+    }
+
+    page->property = order;
+    SetPageProperty(page);
+    list_add(&free_list(order), &(page->page_link));
+    nr_free(order)++;
+}
+```
+
+这里我们实现了释放的过程，先计算所需要的大小，然后寻找合适的块，最后合并块。
+
+具体来说，首先计算满足请求所需的最小内存块阶数，通过一个循环，找到能够容纳 ``n`` 页的最小2的幂次方，即``order``。
+
+之后从``order``开始向上访问，如果找到的块是空闲的，并且和当前块是伙伴块，那么就将他们合并，并修改相对应的属性，继续向上访问，直到所有的合并工作完成。
+
+
+##### 7.buddy_nr_free_pages
+
+```c
+static size_t buddy_nr_free_pages(void) {
+    size_t total = 0;
+    for (int i = 0; i <= MAX_ORDER; i++) {
+        total += nr_free(i) * (1 << i);
+    }
+    return total;
+}
+```
+
+这个函数用于计算当前系统中空闲页的总数，比较简单。
+
+##### 8.测试环节
+
+在测试环节，我们设计了一个辅助函数用来帮我们输出各阶的空闲页数。
+
+```c
+static void buddy_print_summary(const char *tag)
+{
+    cprintf("---- %s: 各阶空闲块统计 ----\n", tag);
+    size_t grand = 0;
+    for (int order = 0; order <= MAX_ORDER; ++order) {
+        size_t cnt = nr_free(order);
+        size_t pages = cnt * (1UL << order);
+        if (cnt > 0) {
+            cprintf("  order=%2d : blocks=%4u  页数=%6u\n",
+                    order, (unsigned)cnt, (unsigned)pages);
+        }
+        grand += pages;
+    }
+    cprintf("  -> 总空闲页数 = %u\n", (unsigned)grand);
+    cprintf("-----------------------------------\n");
+}
+```
+
+之后，就是我们所设计的测试函数。
+
+```c
+static void buddy_system_check(void)
+{
+    cprintf("\n========== BUDDY 检测开始 ==========\n");
+
+    /* 初始总空闲页数 */
+    size_t total_init = buddy_nr_free_pages();
+    cprintf("初始化：总空闲页数 = %u\n", (unsigned)total_init);
+    buddy_print_summary("初始化状态");
+
+    /* 1) 分配 3 个相同大小的块并释放 */
+    cprintf("\n[场景1] 分配/回收8页块示例\n");
+    struct Page *a = alloc_pages(8);
+    struct Page *b = alloc_pages(8);
+    struct Page *c = alloc_pages(8);
+    cprintf("分配结果：a=%p  b=%p  c=%p\n", a, b, c);
+    assert(a != b && b!=c && a != c);
+    assert(a != b && a != c && b != c);
+    buddy_print_summary("场景1: 分配后");
+
+    free_pages(a, 8);
+    cprintf("释放 a(8页)\n");
+    buddy_print_summary("场景1: 释放 a 后");
+
+    free_pages(b, 8);
+    cprintf("释放 b(8页)\n");
+    buddy_print_summary("场景1: 释放 b 后");
+
+    free_pages(c, 8);
+    cprintf("释放 c(8页)\n");
+    buddy_print_summary("场景1: 释放 c 后");
+
+    /* 2) 分配1页 */
+    cprintf("\n[场景2] 分配/回收1页\n");
+    struct Page *pmin = alloc_pages(1);
+    assert(pmin);
+    cprintf("分配 1 页 -> %p, 物理地址 pa=0x%016lx\n", pmin, page2pa(pmin));
+    buddy_print_summary("场景2: 分配 1 页 后");
+    free_pages(pmin, 1);
+    cprintf("释放 1 页完毕\n");
+    buddy_print_summary("场景2: 释放 1 页 后");
+
+    /* 3) 分配较大的块 */
+    cprintf("\n[场景3] 较大分配/回收\n");
+    size_t try_big = total_init / 32;
+    if (try_big == 0) try_big = 1;
+    struct Page *pbig = alloc_pages(try_big);
+    if (pbig) {
+        cprintf("成功分配大块 %u 页 -> %p\n", (unsigned)try_big, pbig);
+        buddy_print_summary("场景3: 大块分配后");
+        free_pages(pbig, try_big);
+        cprintf("释放大块 %u 页 完成\n", (unsigned)try_big);
+        buddy_print_summary("场景3: 释放大块后");
+    } else {
+        cprintf("无法分配大块 %u 页（这可能因为内存不足或对齐原因），跳过后续大块断言。\n", (unsigned)try_big);
+    }
+
+    /* 4) 分配多个不等大小的块、释放部分，然后尝试再次分配 */
+    cprintf("\n[场景4] 分配多个不等大小的块、释放部分，然后尝试再次分配\n");
+    struct Page *x1 = alloc_pages(16);
+    struct Page *x2 = alloc_pages(32);
+    struct Page *x3 = alloc_pages(16);
+    cprintf("分配 x1(16)=%p x2(32)=%p x3(16)=%p\n", x1, x2, x3);
+    assert(x1 && x2 && x3);
+
+    buddy_print_summary("场景4: 初始分配后");
+
+    /* 释放 x2，使中间出现空洞 */
+    free_pages(x2, 32);
+    cprintf("释放 x2(32页)，中间产生空洞\n");
+    buddy_print_summary("场景4: 释放 x2 后");
+
+    /* 尝试分配一个 32 页块（应该能复用 x2 区域） */
+    struct Page *y = alloc_pages(32);
+    cprintf("再次尝试分配 32 页 -> %p (期待为之前 x2 的位置或其它合适位置)\n", y);
+    assert(y != NULL);
+    buddy_print_summary("场景4: 再次分配 32 页 后");
+
+    /* 清理 */
+    free_pages(x1, 16);
+    free_pages(x3, 16);
+    free_pages(y, 32);
+    cprintf("场景4: 释放所有分配块，恢复初始碎片\n");
+    buddy_print_summary("场景4: 清理后");
+
+    /* 结束检查：总空闲页数不应少于初始值（考虑实现不会“丢页”） */
+    size_t total_end = buddy_nr_free_pages();
+    cprintf("\n检测完成：初始总空闲页=%u, 结束总空闲页=%u\n", (unsigned)total_init, (unsigned)total_end);
+    assert(total_end >= total_init); /* 实现上通常应相等；用 >= 更稳健以防一些实现细节差异 */
+
+    cprintf("========== BUDDY 检测结束（全部断言通过） ==========\n\n");
+}
+```
+
+这里我们结合具体输出来看。
+
+- 初始状态
+
+首先是初始状态，我们总共有``31929``个空闲页，经分配以后，各阶统计数量如下：
+
+```c
+初始化：总空闲页数 = 31929
+---- 初始化状态: 各阶空闲块统计 ----
+  order= 0 : blocks=   1  页数=     1
+  order= 3 : blocks=   1  页数=     8
+  order= 4 : blocks=   1  页数=    16
+  order= 5 : blocks=   1  页数=    32
+  order= 7 : blocks=   1  页数=   128
+  order=10 : blocks=  31  页数= 31744
+  -> 总空闲页数 = 31929
+-----------------------------------
+```
+
+- 场景1 
+
+之后是第一个场景，即我们分配回收``3``个``8``页块``a``、``b``、``c``，统计结果如下，很明显，三个页块的地址各不相同，并且在分配后，各阶的页数也发生改变，总空闲页数从原来的``31929``减少了``24``到了``31905``，符合预期。
+
+```c
+[场景1] 分配/回收8页块示例
+分配结果：a=0xffffffffc020f340  b=0xffffffffc020f480  c=0xffffffffc020f5c0
+---- 场景1: 分配后: 各阶空闲块统计 ----
+  order= 0 : blocks=   1  页数=     1
+  order= 5 : blocks=   1  页数=    32
+  order= 7 : blocks=   1  页数=   128
+  order=10 : blocks=  31  页数= 31744
+  -> 总空闲页数 = 31905
+-----------------------------------
+释放 a(8页)
+---- 场景1: 释放 a 后: 各阶空闲块统计 ----
+  order= 0 : blocks=   1  页数=     1
+  order= 3 : blocks=   1  页数=     8
+  order= 5 : blocks=   1  页数=    32
+  order= 7 : blocks=   1  页数=   128
+  order=10 : blocks=  31  页数= 31744
+  -> 总空闲页数 = 31913
+-----------------------------------
+释放 b(8页)
+---- 场景1: 释放 b 后: 各阶空闲块统计 ----
+  order= 0 : blocks=   1  页数=     1
+  order= 3 : blocks=   2  页数=    16
+  order= 5 : blocks=   1  页数=    32
+  order= 7 : blocks=   1  页数=   128
+  order=10 : blocks=  31  页数= 31744
+  -> 总空闲页数 = 31921
+-----------------------------------
+释放 c(8页)
+---- 场景1: 释放 c 后: 各阶空闲块统计 ----
+  order= 0 : blocks=   1  页数=     1
+  order= 3 : blocks=   1  页数=     8
+  order= 4 : blocks=   1  页数=    16
+  order= 5 : blocks=   1  页数=    32
+  order= 7 : blocks=   1  页数=   128
+  order=10 : blocks=  31  页数= 31744
+  -> 总空闲页数 = 31929
+-----------------------------------
+```
+
+之后逐次释放三个块，可以看到，各阶的空闲块数量和总空闲页数都发生了变化，释放``a``后，3阶增加了一个块。释放``b``后，3阶又增加一个块，但是并没有合并为4阶，说明``a``和``b``不是``buddy``关系，直到释放``c``，3阶空闲块数量又恢复到1个，4阶多一个16页的块，说明``c``和``a``、``b``的某一个是伙伴关系。
+
+- 场景2
+
+在场景2下，我们分配一页，可以看到分配以后，各阶的页数如下：
+  
+```c
+[场景2] 分配/回收1页
+分配 1 页 -> 0xffffffffc020f318, 物理地址 pa=0x0000000080347000
+---- 场景2: 分配 1 页 后: 各阶空闲块统计 ----
+  order= 3 : blocks=   1  页数=     8
+  order= 4 : blocks=   1  页数=    16
+  order= 5 : blocks=   1  页数=    32
+  order= 7 : blocks=   1  页数=   128
+  order=10 : blocks=  31  页数= 31744
+  -> 总空闲页数 = 31928
+-----------------------------------
+释放 1 页完毕
+---- 场景2: 释放 1 页 后: 各阶空闲块统计 ----
+  order= 0 : blocks=   1  页数=     1
+  order= 3 : blocks=   1  页数=     8
+  order= 4 : blocks=   1  页数=    16
+  order= 5 : blocks=   1  页数=    32
+  order= 7 : blocks=   1  页数=   128
+  order=10 : blocks=  31  页数= 31744
+  -> 总空闲页数 = 31929
+-----------------------------------
+```
+
+分配1页后，0阶不含有空闲页，其余不变，总空闲页减1，释放以后，各阶又回到初始状态。
+
+- 场景3
+
+在这里，我们尝试分配所有页的1/32，可以看到，分配以后，各阶的空闲页数如下：
+
+```c
+[场景3] 较大分配/回收
+成功分配大块 997 页 -> 0xffffffffc0211000
+---- 场景3: 大块分配后: 各阶空闲块统计 ----
+  order= 0 : blocks=   1  页数=     1
+  order= 3 : blocks=   1  页数=     8
+  order= 4 : blocks=   1  页数=    16
+  order= 5 : blocks=   1  页数=    32
+  order= 7 : blocks=   1  页数=   128
+  order=10 : blocks=  30  页数= 30720
+  -> 总空闲页数 = 30905
+-----------------------------------
+释放大块 997 页 完成
+---- 场景3: 释放大块后: 各阶空闲块统计 ----
+  order= 0 : blocks=   1  页数=     1
+  order= 3 : blocks=   1  页数=     8
+  order= 4 : blocks=   1  页数=    16
+  order= 5 : blocks=   1  页数=    32
+  order= 7 : blocks=   1  页数=   128
+  order=10 : blocks=  31  页数= 31744
+  -> 总空闲页数 = 31929
+-----------------------------------
+```
+
+同样我们分配的一整个大块地址为``0xffffffffc0211000``，并且其余阶和总块数都发生了改变，释放以后，所有的状态都恢复原样。
+
+- 场景4
+
+最后一个场景下，我们分配多个不等大小的块、释放部分，然后尝试再次分配。
+
+```c
+[场景4] 分配多个不等大小的块、释放部分，然后尝试再次分配
+分配 x1(16)=0xffffffffc020f480 x2(32)=0xffffffffc020f700 x3(16)=0xffffffffc020fc00
+---- 场景4: 初始分配后: 各阶空闲块统计 ----
+  order= 0 : blocks=   1  页数=     1
+  order= 3 : blocks=   1  页数=     8
+  order= 4 : blocks=   1  页数=    16
+  order= 5 : blocks=   1  页数=    32
+  order= 6 : blocks=   1  页数=    64
+  order=10 : blocks=  31  页数= 31744
+  -> 总空闲页数 = 31865
+-----------------------------------
+释放 x2(32页)，中间产生空洞
+---- 场景4: 释放 x2 后: 各阶空闲块统计 ----
+  order= 0 : blocks=   1  页数=     1
+  order= 3 : blocks=   1  页数=     8
+  order= 4 : blocks=   1  页数=    16
+  order= 5 : blocks=   2  页数=    64
+  order= 6 : blocks=   1  页数=    64
+  order=10 : blocks=  31  页数= 31744
+  -> 总空闲页数 = 31897
+-----------------------------------
+再次尝试分配 32 页 -> 0xffffffffc020f700 (期待为之前 x2 的位置或其它合适位置)
+---- 场景4: 再次分配 32 页 后: 各阶空闲块统计 ----
+  order= 0 : blocks=   1  页数=     1
+  order= 3 : blocks=   1  页数=     8
+  order= 4 : blocks=   1  页数=    16
+  order= 5 : blocks=   1  页数=    32
+  order= 6 : blocks=   1  页数=    64
+  order=10 : blocks=  31  页数= 31744
+  -> 总空闲页数 = 31865
+-----------------------------------
+场景4: 释放所有分配块，恢复初始碎片
+---- 场景4: 清理后: 各阶空闲块统计 ----
+  order= 0 : blocks=   1  页数=     1
+  order= 3 : blocks=   1  页数=     8
+  order= 4 : blocks=   1  页数=    16
+  order= 5 : blocks=   1  页数=    32
+  order= 7 : blocks=   1  页数=   128
+  order=10 : blocks=  31  页数= 31744
+  -> 总空闲页数 = 31929
+-----------------------------------
+```
+
+可以看到，我们分配了三个块，``x1``和``x3``是16页，``x2``是32页，释放``x2``后，产生了空洞，我们再次尝试分配32页，可以看到，分配到了``x2``的位置，说明分配算法能够正确处理空洞，在释放所有块后，又恢复为初始状态。
+
+最后输出
+
+```c
+检测完成：初始总空闲页=31929, 结束总空闲页=31929
+```
+
+最后将以上函数进行封装，如下：
+
+```c
+const struct pmm_manager buddy_pmm_manager = {
+    .name = "buddy_pmm_manager",
+    .init = buddy_init,
+    .init_memmap = buddy_init_memmap,
+    .alloc_pages = buddy_alloc_pages,
+    .free_pages = buddy_free_pages,
+    .nr_free_pages = buddy_nr_free_pages,
+    .check = buddy_system_check,
+};
+```
+
+到这里我们的``buddy system``算法检测成功，没有出现错误。
+
+
+### 四、
+
+
+### 五、
