@@ -1125,4 +1125,124 @@ const struct pmm_manager buddy_pmm_manager = {
 ### 四、
 
 
-### 五、
+### 五、硬件的可用物理内存范围的获取方法（Challenge）
+
+在前面的练习中，我们已经实现并对比了多种物理内存分配策略（如First-Fit、Best-Fit、Buddy）。这些分配器的前提是：操作系统启动时必须先知道“机器上哪些物理内存可以用”，然后把这些可用区域按页组织成空闲链表，分配器才能工作。本节解释的就是这个前提问题：在启动前不知道硬件内存布局的情况下，OS 如何动态识别可用物理内存，并交给分配器使用。
+
+本实验运行在RISC-V平台上，我们用“设备树（DTB/FDT）”方式来获取内存信息。简单说，设备树就像一份“硬件地图”，由启动引导程序（Bootloader）准备好，告诉OS“内存从哪里开始，有多大”。
+
+#### 1. 基本思路
+设备树是二进制文件，里面有节点和属性。OS解析它，找到“memory”节点，读出内存起点（base）和大小（size）。
+
+- **为什么需要这个？** 硬件内存不是连续的，可能有“空洞”（如设备占用的地址），或保留区（不能用的部分）。直接用错会崩溃。
+- **怎么传给OS？** Bootloader把DTB的物理地址放进寄存器，OS通过全局变量`boot_dtb`拿到。
+
+#### 2. RISC-V上的DTB解析步骤
+OS先把DTB的物理地址映射到虚拟地址（加`PHYSICAL_MEMORY_OFFSET`），然后一步步解析，：
+
+1. **校验DTB**：检查开头“魔数”（magic number）是不是`0xd00dfeed`，确认是有效DTB。如果不对，就报错。
+2. **定位结构**：DTB分成“结构区”（节点/属性）、“字符串区”（名字）和“保留区”。用头部的偏移量找到它们。
+3. **遍历节点树**：从根节点开始，找名叫“memory”的节点（通常是`/memory`）。
+4. **读reg属性**：在memory节点里，`reg`属性存着`<base, size>`（64位地址+大小）。解析它，得到内存起点和总大小。
+5. **计算范围**：结束地址 = base + size - 1。
+下面是本实验解析 `/memory/reg` 的核心逻辑引用：
+
+```
+// 简化的内存信息提取函数：查找 memory 节点的 reg 属性
+static int extract_memory_info(uintptr_t dtb_vaddr, const struct fdt_header *header, 
+                              uint64_t *mem_base, uint64_t *mem_size) {
+    uint32_t struct_offset = fdt32_to_cpu(header->off_dt_struct);
+    uint32_t strings_offset = fdt32_to_cpu(header->off_dt_strings);
+    const char *strings_base = (const char *)(dtb_vaddr + strings_offset);
+    const uint32_t *struct_ptr = (const uint32_t *)(dtb_vaddr + struct_offset);
+    int in_memory_node = 0;
+    while (1) {
+        uint32_t token = fdt32_to_cpu(*struct_ptr++);
+        switch (token) {
+            case FDT_BEGIN_NODE: {
+                const char *name = (const char *)struct_ptr;
+                int name_len = strlen(name);
+                if (strncmp(name, "memory", 6) == 0) {
+                    in_memory_node = 1;
+                }
+                struct_ptr = (const uint32_t *)(((uintptr_t)struct_ptr + name_len + 4) & ~3);
+                break;
+            }
+            case FDT_END_NODE:
+                in_memory_node = 0;
+                break;
+            case FDT_PROP: {
+                uint32_t prop_len = fdt32_to_cpu(*struct_ptr++);
+                uint32_t prop_nameoff = fdt32_to_cpu(*struct_ptr++);
+                const char *prop_name = strings_base + prop_nameoff;
+                const void *prop_data = struct_ptr;
+                if (in_memory_node && strcmp(prop_name, "reg") == 0 && prop_len >= 16) {
+                    const uint64_t *reg_data = (const uint64_t *)prop_data;
+                    *mem_base = fdt64_to_cpu(reg_data[0]);
+                    *mem_size = fdt64_to_cpu(reg_data[1]);
+                    return 0;
+                }
+                struct_ptr = (const uint32_t *)(((uintptr_t)struct_ptr + prop_len + 3) & ~3);
+                break;
+            }
+            case FDT_END: return -1;
+            default: return -1;
+        }
+    }
+}
+```
+
+DTB初始化函数（在`dtb_init`）调用这个，打印结果，比如“Base: 0x80000000, Size: 0x10000000 (256MB)”。
+
+#### 3. 和分配器的连接
+拿到`(base, size)`后，删除不能分配的部分：
+- **上限检查**：如果内存超过内核能映射的顶（KERNTOP），截断到KERNTOP。
+- **扣内核占用**：内核代码、数据和Page元数据（`pages[]`数组）占了前面一部分。从`end[]`后面开始，向上取整到页边界，作为可用起点。
+- **页对齐**：起点向上取整，终点向下取整，确保整页。
+- **建空闲链表**：调用`init_memmap(pa2page(begin), (end - begin)/PGSIZE)`，把可用页加到链表，交给First-Fit等分配器。
+```
+// ... (从DTB拿mem_begin, mem_size, mem_end)
+npage = maxpa / PGSIZE;  // 总页数
+pages = ROUNDUP((void *)end, PGSIZE);  // 元数据区
+// 标记保留页
+freemem = PADDR((uintptr_t)pages + sizeof(struct Page) * npage);
+mem_begin = ROUNDUP(freemem, PGSIZE);  // 可用起点
+mem_end = ROUNDDOWN(mem_end, PGSIZE);  // 可用终点
+init_memmap(pa2page(mem_begin), (mem_end - mem_begin) / PGSIZE);
+```
+
+这样，分配器就在“安全清单”上工作，不会碰保留区。
+
+#### 4. 常见边界情况
+- **多段内存**：reg可能有多个`<base, size>`（如分散的RAM）。当前代码只取第一段，实际应循环全取。
+- **保留区**：DTB头部有`memreserve`表，列出不能用的区间（如固件区）。还可能有`/reserved-memory`节点。需从可用区“减掉”这些。
+- **字节序**：DTB是大端（高字节先存），必须用`fdt32_to_cpu`转成CPU顺序。
+- **空洞**：内存中可能夹设备地址（MMIO），reg会避开它们。
+- **大小单元**：reg的格式取决于`#address-cells`和`#size-cells`（通常2，表示64位）。当前假设2，实际应动态读父节点。
+
+#### 5. 本实验实现的局限与改进
+- **局限**：
+  - 只解析第一段内存，忽略多段。
+  - 未处理`memreserve`和`/reserved-memory`，可能把保留区当成可用。
+  - 固定假设64位地址/大小，不自适应。
+  - 只打印范围，没标准输出“段清单”。
+
+- **改进想法**：
+  1. **多段解析**：读`#address-cells/#size-cells`，循环reg的所有对，存到数组。
+  2. **减保留区**：解析`memreserve`表，从可用段“切掉”重叠部分。
+     示例代码：
+  3. **多段初始化**：在pmm.c用循环调用`init_memmap`，每段单独加链表。
+  4. **打印段表**：加函数输出所有可用段，方便调试对比DTB和OS视图。
+  5. **测试**：模拟多段/保留DTB，检查OS是否正确避开。
+
+#### 6. 总结
+- Bootloader给OS DTB地址 → OS映射成虚拟地址 → 解析memory/reg → 得(base, size)。
+- 扣上限/内核占用/对齐 → 得干净区间[begin, end)。
+- init_memmap建链表 → 分配器用。
+
+- 假设 DTB 告诉我们：物理内存从 `0x80000000` 开始，大小为 `0x20000000`（即 512MB）。
+- 那么物理内存范围就是 `[0x80000000, 0x9FFFFFFF]`。
+- 内核镜像（文本/数据/BSS）加上 `pages[]` 元数据占用了前面一段地址，比如占到 `0x80250000`（举例）。
+- 我们会把这段占用区域“扣掉”，从下一个页对齐位置开始作为真正可分配的起点，例如 `ROUNDUP(0x80250000, 4KB)`。
+- 再把终点按页对齐向下取整（避免落在半页）。最终得到一个“可分配区间”。
+- `init_memmap` 会把这段区间转换成“按物理地址升序”的空闲页链表。至此，前文的 First‑Fit/Best‑Fit/Buddy 就能直接工作了。
