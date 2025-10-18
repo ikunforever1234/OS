@@ -580,7 +580,23 @@ best_fit_free_pages(struct Page *base, size_t n) {
 - 充分合并可降低外部碎片，使 Best-Fit 在分配时更容易找到“刚好合适”的最小块。
 
 
+##### 4.结果测试
 
+在将``pmm.c``文件里的``pmm_manager``更换为我们的``best_fit_pmm_manager``后，输入 ``make grade`` ，我们可以得到以下的输出，说明我们的代码没有问题，成功实现 ``Best fit`` 算法。
+
+```c
+syl@LAPTOP-RNJJSCQG:~/lab/OS/labcode/lab2$ make grade
+>>>>>>>>>> here_make>>>>>>>>>>>
+gmake[1]: Entering directory '/home/syl/lab/OS/labcode/lab2' + cc kern/init/entry.S + cc kern/init/init.c + cc kern/libs/stdio.c + cc kern/debug/panic.c + cc kern/driver/console.c + cc kern/driver/dtb.c + cc kern/mm/best_fit_pmm.c + cc kern/mm/buddy_pmm.c + cc kern/mm/default_pmm.c + cc kern/mm/pmm.c + cc kern/mm/slub_pmm.c + cc libs/printfmt.c + cc libs/readline.c + cc libs/sbi.c + cc libs/string.c + ld bin/kernel riscv64-unknown-elf-objcopy bin/kernel --strip-all -O binary bin/ucore.img gmake[1]: Leaving directory '/home/syl/lab/OS/labcode/lab2'
+>>>>>>>>>> here_make>>>>>>>>>>>
+<<<<<<<<<<<<<<< here_run_qemu <<<<<<<<<<<<<<<<<<
+try to run qemu
+qemu pid=2454
+<<<<<<<<<<<<<<< here_run_check <<<<<<<<<<<<<<<<<<
+  -check physical_memory_map_information:    OK
+  -check_best_fit:                           OK
+Total Score: 25/25
+```
 
 
 
@@ -1122,7 +1138,630 @@ const struct pmm_manager buddy_pmm_manager = {
 到这里我们的``buddy system``算法检测成功，没有出现错误。
 
 
-### 四、
+### 四、扩展练习Challenge：任意大小的内存单元slub分配算法
+
+slub算法，实现两层架构的高效内存单元分配，第一层是**基于页大小**的内存分配，第二层是在第一层基础上实现**基于任意大小**的内存分配，它通过为每种对象类型维护**缓存（slab）**，在页内用位图管理空闲对象，并使用**每CPU本地缓存**减少锁竞争，从而实现比传统SLAB结构更简单、速度更快、碎片更少的内存分配与回收机制。
+
+#### 设计思路
+##### 1.基本数据结构定义
+
+
+
+```c
+typedef struct slab {
+    list_entry_t slab_link;    // 链表连接，用于连接到缓存的不同状态链表
+    void *s_mem;               // slab内存起始地址（对象存储区域）
+    unsigned int inuse;         // 当前已使用的对象数量
+    void *freelist;            // 空闲对象链表头指针
+    unsigned int free_count;   // 空闲对象计数
+    struct kmem_cache *cache;  // 所属的kmem缓存
+    struct Page *page;         // 对应的物理页
+} slab_t;
+```
+`slab_t`表示一个具体的“slab页”，一个 slab 是内核中分配给某种对象类型的一块连续物理页区域（例如 1 页或 2 页）。它内部被划分成若干个固定大小的小对象（object），用于快速分配。
+
+一个`slab`就是一个“对象池”，里面放着多个大小相同的对象；`freelist`指向未分配的对象；`inuse` 和 `free_count `追踪 `slab `的使用情况；
+`slab_link` 让 `slab `能加入所属缓存的 `free`/`partial`/`full`链表。
+```c
+typedef struct kmem_cache {
+    char name[SLUB_CACHE_NAME_LEN]; // 缓存名称标识
+    size_t object_size;        // 请求的对象大小
+    size_t actual_size;        // 实际分配大小（包含对齐填充）
+    unsigned int align;        // 对齐要求
+    unsigned int objs_per_slab; // 每个slab包含的对象数量
+    unsigned int order;        // slab的页阶数（2^order页）
+    
+    // 三种状态的slab链表管理
+    list_entry_t slabs_full;    // 完全使用的slab链表
+    list_entry_t slabs_partial;  // 部分使用的slab链表  
+    list_entry_t slabs_free;    // 完全空闲的slab链表
+    list_entry_t cache_link;   // 全局缓存链表连接
+
+    // 统计信息
+    unsigned long num_slabs;    // 管理的slab总数
+    unsigned long num_objects; // 总对象数量
+    int initialized;           // 初始化状态标记
+} kmem_cache_t;
+```
+`kmem_cache_t`表示一类对象的缓存，作用是为某种大小的对象维护一个统一的缓存。例如一个`cache`管理所有 64字节的对象；另一个` cache `管理 256 字节的对象。
+
+每个 `kmem_cache `对应一种固定对象大小；通过三个链表（`free`、`partial`、`full`）管理不同使用状态的`slab`；当分配时，从 `partial `或` free `列表取 `slab`；当 `slab `用满或释放完对象时，会在这些链表之间移动；`order `决定该缓存每个 `slab` 使用几页（例如 order=0 → 1 页，order=1 → 2 页）。
+```c
+typedef struct slub_manager {
+    list_entry_t cache_chain;   // 所有缓存的全局链表
+    size_t num_caches;         // 缓存数量统计
+    
+    // 预定义的固定大小缓存指针
+    kmem_cache_t *cache_16;    // 16字节对象缓存
+    kmem_cache_t *cache_32;    // 32字节对象缓存
+    kmem_cache_t *cache_64;    // 64字节对象缓存
+    kmem_cache_t *cache_128;   // 128字节对象缓存
+    kmem_cache_t *cache_256;   // 256字节对象缓存
+    kmem_cache_t *cache_512;   // 512字节对象缓存
+    kmem_cache_t *cache_1024;  // 1024字节对象缓存
+    kmem_cache_t *cache_2048;  // 2048字节对象缓存
+    
+    // 全局统计
+    unsigned long total_allocated; // 总分配字节数
+    unsigned long total_freed;     // 总释放字节数
+    int init_phase;               // 初始化阶段标记
+} slub_manager_t;
+```
+`slub_manager_t`是全局的`SLUB`管理器，是整个`SLUB` 分配器的总控结构，维护所有大小的缓存（如 16B、32B、64B … 2048B）。
+
+`slub_mgr`就是整个 `SLUB` 系统的“总表”，启动时初始化 8 个标准缓存，提供全局统计，测试接口，通过链表`cache_chain` 把所有 cache 管理起来。
+
+总之，`slab_t` 表示“一个对象池”，负责管理对象分配；`kmem_cache_t` 表示“某类对象的缓存”，组织多个 `slab`；`slub_manager_t `表示“整个 SLUB 系统”，负责全局缓存调度；`free_area_t`是页级分配器，为 `slab` 分配物理页。
+##### 2.全局变量和辅助宏定义
+```c
+//全局变量 
+static slub_manager_t slub_mgr;
+static free_area_t free_area;
+#define free_list (free_area.free_list)
+#define nr_free (free_area.nr_free)
+```
+如上所示，`slub_mgr`是全局的 **SLUB管理器结构体**；`free_area`是页级物理内存空闲区管理结构，记录哪些物理页`Page`还未被分配；提供给 `SLUB `作为底层页源，当某个 `cache` 需要新的 `slab` 时，就从这里分配页。最后两行和best_fit一样，访问**全局空闲页链表与空闲页数量**。
+
+
+```c
+//辅助宏定义 
+#define le2slab(le, member) to_struct((le), slab_t, member)
+#define le2cache(le, member) to_struct((le), kmem_cache_t, member)
+```
+这两行是**SLUB分配器中用于链表遍历的辅助宏**，根据链表节点地址，反向推导出它所在的结构体指针。`le2slab(le, member)`从链表节点 `le` 推出所属的 `slab_t *` ;`le2cache(le, member)`从链表节点 `le` 推出所属的 `kmem_cache_t *`。
+##### 3.辅助函数
+辅助函数可以归结为以下六个：
+
+`slub_calculate_size()` 根据对象大小和对齐要求计算**实际分配大小**。
+`slub_calculate_order()` 根据对象大小计算对应 **slab 页阶数（order）**，**决定 slab 占用的页数**。
+`slub_init_slab()` **初始化 slab 结构**，建立空闲对象链表。
+`slub_cache_create_static()` 为某一对象大小**创建缓存结构**，并加入全局管理链表。
+`slub_cache_init_lazy()` **延迟初始化 slab**，当第一次分配请求到来时创建 slab。
+`slub_alloc_slab()` **分配一个新的 slab 并初始化**，返回 slab 指针。
+
+```c
+// 根据对象大小和对齐要求计算实际分配大小
+static size_t slub_calculate_size(size_t size, unsigned int align) {
+    if (align > 0) {
+        return ROUNDUP(size, align);
+    }
+    return ROUNDUP(size, sizeof(void *));
+}
+```
+计算分配给对象的**实际内存大小**。如果指定了 `align`，则**按对齐向上取整**；否则按指针大小对齐。这样的话，就可以保证slab内对象满足对齐要求，避免未对齐访问。
+
+
+```c
+// 根据对象大小计算 slab 页阶数（order）
+static unsigned int slub_calculate_order(size_t object_size) {
+    size_t slab_size = PGSIZE;
+    unsigned int order = 0;
+    
+    while (order < SLUB_MAX_ORDER) {
+        size_t available = slab_size - sizeof(slab_t);
+        unsigned int objs = available / object_size;
+        
+        if (objs >= 4 && (available - objs * object_size) < slab_size / 2) {
+            break;
+        }
+        
+        order++;
+        slab_size <<= 1;
+    }
+    
+    return order;
+}
+```
+根据**对象大小**计算 **slab 占用页数（2^order 页）**。保证每个 `slab`至少有 4 个对象，并尽量减少浪费。举例而言，如果对象较小，可能 `order=0（1 页）`；对象大时，`order` 增加，每个 `slab`使用多页。
+```c
+// 初始化 slab 结构
+static void slub_init_slab(slab_t *slab, kmem_cache_t *cache, struct Page *page) {
+    uintptr_t kva = (uintptr_t)page2kva(page);
+    slab->s_mem = (void *)kva;
+    slab->inuse = 0;
+    slab->free_count = cache->objs_per_slab;
+    slab->cache = cache;
+    slab->page = page;
+    slab->freelist = NULL;
+    
+    char *obj = slab->s_mem;
+    for (int i = 0; i < cache->objs_per_slab; i++) {
+        *(void**)obj = slab->freelist;
+        slab->freelist = obj;
+        obj += cache->actual_size;
+    }
+}
+```
+初始化 `slab` 对象池。`freelist `链表存储空闲对象，每个对象指向下一个空闲对象。`inuse` 和 `free_count` 分别追踪已分配和空闲对象数。在分配新的 `slab `时调用，建立对象链表以便快速分配。
+
+```c
+// 创建静态缓存（固定大小对象）
+static kmem_cache_t *slub_cache_create_static(const char *name, size_t size, unsigned int align, kmem_cache_t *cache) {
+    strncpy(cache->name, name, SLUB_CACHE_NAME_LEN - 1);
+    cache->name[SLUB_CACHE_NAME_LEN - 1] = '\0';
+    cache->object_size = size;
+    cache->actual_size = slub_calculate_size(size, align);
+    cache->align = align;
+    cache->order = slub_calculate_order(cache->actual_size);
+    
+    size_t slab_size = PGSIZE << cache->order;
+    cache->objs_per_slab = (slab_size - sizeof(slab_t)) / cache->actual_size;
+    
+    list_init(&cache->slabs_full);
+    list_init(&cache->slabs_partial);
+    list_init(&cache->slabs_free);
+    
+    cache->num_slabs = 0;
+    cache->num_objects = 0;
+    cache->initialized = 0;
+    
+    list_add(&slub_mgr.cache_chain, &cache->cache_link);
+    slub_mgr.num_caches++;
+    
+    cprintf("slub: created cache '%s'\n", name);
+    return cache;
+}
+```
+为特定大小对象创建缓存 `kmem_cache_t`。初始化三类`slab`链表：`slabs_free、slabs_partial、slabs_full`。计算每个 `slab` 可容纳对象数，在系统启动时创建标准大小缓存，16B、32B……2048B。
+```c
+// 延迟初始化 slab，当第一次分配请求到来时创建 slab
+static void slub_cache_init_lazy(kmem_cache_t *cache) {
+    if (cache->initialized) {
+        return;
+    }
+    struct Page *page = alloc_pages(1 << cache->order);
+    if (!page) {
+        cprintf("slub: WARNING - failed to allocate initial slab for cache '%s'\n", cache->name);
+        return;
+    }  
+    slab_t *slab = (slab_t*)page2kva(page);
+    slub_init_slab(slab, cache, page);
+    list_add(&cache->slabs_free, &slab->slab_link);
+    
+    cache->num_slabs = 1;
+    cache->num_objects = cache->objs_per_slab;
+    cache->initialized = 1;
+}
+```
+这个函数目的是让第一次分配对象时才创建 `slab`，避免启动时一次性占用太多内存。其中`slabs_free `链表加入新 `slab`，用于首次分配。
+```c
+// 分配一个新的 slab 并初始化
+static slab_t *slub_alloc_slab(kmem_cache_t *cache) {
+    if (!cache->initialized) {
+        slub_cache_init_lazy(cache);
+        if (!cache->initialized) {
+            return NULL;
+        }
+    }
+    unsigned int order = cache->order;
+    struct Page *page = alloc_pages(1 << order);
+    if (!page) {
+        return NULL;
+    }
+    
+    uintptr_t kva = (uintptr_t)page2kva(page);
+    slab_t *slab = (slab_t*)kva;
+    slub_init_slab(slab, cache, page);
+    
+    cache->num_slabs++;
+    cache->num_objects += cache->objs_per_slab;   
+    return slab;
+}
+```
+如果当前  `slabs_partial` 和 `slabs_free `都没有空闲 ，`slab `时调用分配新的 `slab` 并初始化，这样就可以做到**动态扩展缓存**。
+
+##### 4.核心的分配，释放函数
+slub的核心是 slab + cache + 页管理，kmalloc/kfree 是对外调用接口，在后续代码里我使用了编写的简易`slub_kmalloc`和`slub_kfree`，也可以做到选择缓存，分配/释放缓存，成功通过测试环节。
+```c
+// 从指定缓存分配一个对象
+static void *slub_cache_alloc(kmem_cache_t *cache) {
+    if (!cache) return NULL;
+    
+    // 延迟初始化
+    if (!cache->initialized) {
+        slub_cache_init_lazy(cache);
+        if (!cache->initialized) return NULL;
+    }
+    
+    slab_t *slab = NULL;
+    void *object = NULL;
+
+    // 优先从部分使用的 slab 分配
+    if (!list_empty(&cache->slabs_partial)) {
+        list_entry_t *le = list_next(&cache->slabs_partial);
+        slab = le2slab(le, slab_link);
+    } 
+    // 再从空闲 slab 分配，并移动到部分使用链表
+    else if (!list_empty(&cache->slabs_free)) {
+        list_entry_t *le = list_next(&cache->slabs_free);
+        slab = le2slab(le, slab_link);
+        list_del(le);
+        list_add(&cache->slabs_partial, le);
+    } 
+    // 都没有可用 slab，则分配新的 slab
+    else {
+        slab = slub_alloc_slab(cache);
+        if (!slab) return NULL;
+        list_add(&cache->slabs_partial, &slab->slab_link);
+    }
+    
+    if (!slab) return NULL;
+
+    // 从 slab 的空闲对象链表分配
+    object = slab->freelist;
+    if (!object) return NULL;
+    
+    slab->freelist = *(void**)object;
+    slab->inuse++;
+    slab->free_count--;
+    
+    // slab 已满，则移动到 full 链表
+    if (slab->inuse == cache->objs_per_slab) {
+        list_del(&slab->slab_link);
+        list_add(&cache->slabs_full, &slab->slab_link);
+    }
+    
+    // 分配时清零
+    memset(object, 0, cache->object_size);
+    slub_mgr.total_allocated += cache->actual_size;
+    
+    return object;
+}
+```
+核心分配函数之一，直接从指定缓存 `kmem_cache_t `中分配对象。
+
+优先使用 `slabs_partial`，避免空闲` slab `被过早占用。
+空闲`slab`则初始化到 `slabs_partial` 再分配。
+如果没有 `slab` 可用，则调用 `slub_alloc_slab` 创建新的 `slab`。
+分配后更新 `inuse、free_count`，必要时移动 `slab 链表。
+
+做到使用`freelist` 快速分配对象，无需扫描整个 slab。
+
+
+```c
+static void slub_cache_free(kmem_cache_t *cache, void *obj) {
+    if (!obj || !cache) return;
+    
+    if (!cache->initialized) {
+        return;
+    }
+    
+    uintptr_t kva = (uintptr_t)obj;
+    uintptr_t pa = PADDR(obj);
+    struct Page *page = pa2page(pa);
+    uintptr_t slab_kva = (uintptr_t)page2kva(page);
+    slab_t *slab = (slab_t*)slab_kva;
+    // 确认对象属于该 cache
+    if (slab->cache != cache) {
+        return;
+    }
+ // 将对象插回 slab 的 freelist    
+    *(void**)obj = slab->freelist;
+    slab->freelist = obj;
+    slab->inuse--;
+    slab->free_count++;
+    
+    list_entry_t *le = &slab->slab_link;
+    // slab 空了，移动到 free 链表
+    if (slab->inuse == 0) {
+        list_del(le);
+        list_add(&cache->slabs_free, le);
+    } else if (slab->inuse == cache->objs_per_slab - 1) {
+        list_del(le);  // slab 由满变为部分使用
+        list_add(&cache->slabs_partial, le);
+    }
+    
+    slub_mgr.total_freed += cache->actual_size;
+}
+```
+
+核心释放函数之一，将对象归还`slab`对象池。
+
+对象插回 `slab`的`freelist`。
+更新 `slab` 状态（inuse、free_count）。
+根据使用情况移动 `slab` 链表：`full → partial、partial → free`。
+
+```c
+// 通用 kmalloc 分配接口
+static void *slub_kmalloc(size_t size) {
+    if (size == 0) return NULL;
+
+    // 大对象直接按页分配
+    if (size > SLUB_MAX_OBJECT_SIZE) {
+        size_t pages = ROUNDUP(size, PGSIZE) / PGSIZE;
+        struct Page *page = alloc_pages(pages);
+        return page ? page2kva(page) : NULL;
+    }
+
+    // 根据大小选择合适缓存
+    kmem_cache_t *cache = NULL;
+    if (size <= 16) cache = slub_mgr.cache_16;
+    else if (size <= 32) cache = slub_mgr.cache_32;
+    else if (size <= 64) cache = slub_mgr.cache_64;
+    else if (size <= 128) cache = slub_mgr.cache_128;
+    else if (size <= 256) cache = slub_mgr.cache_256;
+    else if (size <= 512) cache = slub_mgr.cache_512;
+    else if (size <= 1024) cache = slub_mgr.cache_1024;
+    else cache = slub_mgr.cache_2048;
+
+    return cache ? slub_cache_alloc(cache) : NULL;
+}
+```
+提供通用接口给内核调用，类似标准` kmalloc`。
+**小对象走缓存，大对象按页分配**。
+这样就只需传入大小，自动选择缓存。
+```c
+static void slub_kfree(void *obj) {
+    if (!obj) return;
+    
+    uintptr_t pa = PADDR(obj);
+    struct Page *page = pa2page(pa);
+    if (page->property > 1) {
+        free_pages(page, page->property);
+        return;
+    }    // 大对象直接释放页
+      // 遍历所有标准缓存，找到所属 slab 释放
+    kmem_cache_t *caches[] = {
+        slub_mgr.cache_16, slub_mgr.cache_32, slub_mgr.cache_64,
+        slub_mgr.cache_128, slub_mgr.cache_256, slub_mgr.cache_512,
+        slub_mgr.cache_1024, slub_mgr.cache_2048, NULL
+    };
+     // 遍历 full / partial / free 链表
+    for (int i = 0; caches[i] != NULL; i++) {
+        if (caches[i] && caches[i]->initialized) {
+            uintptr_t obj_addr = (uintptr_t)obj;
+            list_entry_t *le;
+            
+            for (le = list_next(&caches[i]->slabs_full); le != &caches[i]->slabs_full; le = list_next(le)) {
+                slab_t *slab = le2slab(le, slab_link);
+                uintptr_t slab_start = (uintptr_t)slab->s_mem;
+                uintptr_t slab_end = slab_start + caches[i]->objs_per_slab * caches[i]->actual_size;
+                if (obj_addr >= slab_start && obj_addr < slab_end) {
+                    slub_cache_free(caches[i], obj);
+                    return;
+                }
+            }
+            
+            for (le = list_next(&caches[i]->slabs_partial); le != &caches[i]->slabs_partial; le = list_next(le)) {
+                slab_t *slab = le2slab(le, slab_link);
+                uintptr_t slab_start = (uintptr_t)slab->s_mem;
+                uintptr_t slab_end = slab_start + caches[i]->objs_per_slab * caches[i]->actual_size;
+                if (obj_addr >= slab_start && obj_addr < slab_end) {
+                    slub_cache_free(caches[i], obj);
+                    return;
+                }
+            }
+            
+            for (le = list_next(&caches[i]->slabs_free); le != &caches[i]->slabs_free; le = list_next(le)) {
+                slab_t *slab = le2slab(le, slab_link);
+                uintptr_t slab_start = (uintptr_t)slab->s_mem;
+                uintptr_t slab_end = slab_start + caches[i]->objs_per_slab * caches[i]->actual_size;
+                if (obj_addr >= slab_start && obj_addr < slab_end) {
+                    slub_cache_free(caches[i], obj);
+                    return;
+                }
+            }
+        }
+    }
+      // 如果不是缓存对象，按页释放
+    free_pages(page, 1);
+}
+```
+同样是核心释放接口之一，支持缓存对象与大对象。
+这一过程，遍历缓存链表定位 `slab`，调用 `slub_cache_free` 回收对象。
+大对象直接释放页，无需`slab`机制。
+
+##### 5.pmm接口函数和接口封装
+可以这样理解，`PMM`是管理页，第一层，通用简单，任何分配器都依赖它。而`SLUB`基于`PMM`做对象缓存管理，第二层，复杂一些，处理对象大小、缓存、slab 等。
+
+因此，这些接口函数及封装与best_fit、first_fit的算法是类似的，基本可以直接套用，编写代码时有些许区别如下，这里不过多展示代码：
+
+`slub_init`，`slub_init_memmap`多涉及到对象缓存;
+
+`slub_alloc_pages`的SLUB初始化阶段直接从`free_list`分配，且`SLUB`对小页对象使用`slab`缓存，`Best-fit`直接按页管理。
+
+`slub_free_pages`逻辑与`bestfit`一致，但涉及到缓存层，区分单页或多页。
+
+`slub_nr_free_pages`与`bestfit`基本一致；
+
+`slub_check`是针对测试函数检查，下面给出测试过程及结果。
+
+##### 6.一些测试函数
+```c
+
+static void slub_test_basic(void) {
+    cprintf("=== SLUB Basic Test ===\n");
+    
+    kmem_cache_t *test_cache = slub_mgr.cache_64;
+    slub_cache_init_lazy(test_cache);
+    
+    if (!test_cache || !test_cache->initialized) {
+        cprintf("SLUB Test SKIPPED: memory system not ready\n");
+        return;
+    }
+    
+    void *objs[3];
+    for (int i = 0; i < 3; i++) {
+        objs[i] = slub_cache_alloc(test_cache);
+        if (!objs[i]) {
+            cprintf("SLUB Test FAILED: allocation failed\n");
+            return;
+        }
+        *(int*)objs[i] = i;
+        if (*(int*)objs[i] != i) {
+            cprintf("SLUB Test FAILED: memory corruption\n");
+            return;
+        }
+    }
+    
+    cprintf("Basic allocation test PASSED\n");
+    
+    for (int i = 0; i < 3; i++) {
+        slub_cache_free(test_cache, objs[i]);
+    }
+    
+    cprintf("Basic free test PASSED\n");
+    
+    for (int i = 0; i < 3; i++) {
+        objs[i] = slub_cache_alloc(test_cache);
+        if (!objs[i]) {
+            cprintf("SLUB Test FAILED: reallocation failed\n");
+            return;
+        }
+    }
+    
+    cprintf("Reallocation test PASSED\n");
+}
+```
+这个函数主要验证了 SLUB 分配器对固定大小对象缓存的功能：
+
+- 基本分配测试：
+从 `cache_64`（每个对象 64 字节）中分配 3 个对象。
+给每个对象写入不同的整数值（0、1、2），再读回来检查是否正确。
+如果分配失败，写入数据被破坏，就报告失败。
+成功则输出 “Basic allocation test PASSED”。
+
+- 基本释放测试：
+将之前分配的 3 个对象逐个释放回缓存。
+检查释放过程是否顺利，该过程主要通过链表状态和 `freelist` 管理。
+成功则输出 “Basic free test PASSED”。
+
+- 重分配测试：
+再次从缓存中分配 3 个对象，模拟释放后再用的场景。
+检查是否能成功重新分配，确保缓存复用正常。
+成功则输出 “Reallocation test PASSED”。
+
+```c
+
+static void slub_test_kmalloc(void) {
+    cprintf("=== SLUB kmalloc Test ===\n");
+    
+    void *small = slub_kmalloc(16);
+    if (small) {
+        memset(small, 0xAA, 16);
+        slub_kfree(small);
+        cprintf("kmalloc small test PASSED\n");
+    } else {
+        cprintf("kmalloc small test SKIPPED\n");
+    }
+    
+    void *medium = slub_kmalloc(128);
+    if (medium) {
+        memset(medium, 0xBB, 128);
+        slub_kfree(medium);
+        cprintf("kmalloc medium test PASSED\n");
+    } else {
+        cprintf("kmalloc medium test SKIPPED\n");
+    }
+    
+    cprintf("kmalloc test completed\n");
+}
+```
+这个函数测试SLUB分配器的 `slub_kmalloc/slub_kfree`接口。通过 `slub_kmalloc`分配不同大小的内存块，填充测试数据后释放，验证 SLUB 分配器的正确性。
+
+```c
+
+static void slub_check(void) {
+    cprintf("=== SLUB Memory Manager Check ===\n");
+    
+    slub_run_tests();
+    
+    cprintf("SLUB cache status:\n");
+  
+    cprintf("  Total allocated: %lu bytes\n", slub_mgr.total_allocated);
+    cprintf("  Total freed: %lu bytes\n", slub_mgr.total_freed);
+    
+    list_entry_t *le = &slub_mgr.cache_chain;
+    while ((le = list_next(le)) != &slub_mgr.cache_chain) {
+        kmem_cache_t *cache = le2cache(le, cache_link);
+        cprintf("  Cache '%s': %lu slabs, %lu objects\n",
+                cache->name, cache->num_slabs, cache->num_objects);
+    }
+    
+    cprintf("SLUB check completed.\n");
+}
+```
+测试和打印一些SLUB内存分配器的运行状态，统计信息。
+
+输出如下：
+
+```c
+memory management: slub_pmm_manager
+slub: created cache 'slub-16'
+slub: created cache 'slub-32'
+slub: created cache 'slub-64'
+slub: created cache 'slub-128'
+slub: created cache 'slub-256'
+slub: created cache 'slub-512'
+slub: created cache 'slub-1024'
+slub: created cache 'slub-2048'
+```
+这是`slub_init()`的输出，说明`SLUB PMM`被选作内存管理器。
+`slub_cache_create_static()`打印每个缓存被创建的名字，如上所示 `'slub-16'`表示存储16字节对象的缓存。一共创建了8个不同大小的缓存，从 16B 到 2048B。
+
+```c
+physcial memory map:
+  memory: 0x0000000008000000, [0x0000000080000000, 0x0000000087ffffff].
+```
+这是 SLUB 在 `slub_init_memmap()` 初始化物理内存后打印的映射信息。
+显示了内存起始地址和大小：128MB。
+
+```c
+=== SLUB Memory Manager Check ===
+
+=== Starting SLUB Tests ===
+=== SLUB Basic Test ===
+Basic allocation test PASSED
+Basic free test PASSED
+Reallocation test PASSED
+=== SLUB kmalloc Test ===
+kmalloc small test PASSED
+kmalloc medium test PASSED
+kmalloc test completed
+=== SLUB Tests Completed ===
+```
+这些输出说明：
+
+- 调用 `slub_cache_alloc(slub_mgr.cache_64) `三次，写入并读回验证；释放上面分配的对象；再次分配 3 个对象，验证重新分配。全部通过。
+
+- 分配不同字节对象，填充后再释放，全部通过。
+
+```c
+SLUB cache status:
+  Total allocated: 6672 bytes
+  Total freed: 192 bytes
+  Cache 'slub-2048': 1 slabs, 7 objects
+  Cache 'slub-1024': 0 slabs, 0 objects
+  Cache 'slub-512': 0 slabs, 0 objects
+  Cache 'slub-256': 0 slabs, 0 objects
+  Cache 'slub-128': 1 slabs, 31 objects
+  Cache 'slub-64': 1 slabs, 63 objects
+  Cache 'slub-32': 0 slabs, 0 objects
+  Cache 'slub-16': 1 slabs, 252 objects
+SLUB check completed.
+check_alloc_page() succeeded!
+```
+输出SLUB 总共分配的字节数和释放的字节数，同时显示每个缓存都有对应 slab 和对象数量，例如cache-64有1 slab，63 个对象，没有出现异常，总分配和总释放字节数符合预期，测试通过。
 
 
 ### 五、硬件的可用物理内存范围的获取方法（Challenge）

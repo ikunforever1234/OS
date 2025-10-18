@@ -1,3 +1,5 @@
+// Challenge1  2311727 苏耀磊
+
 #include <pmm.h>
 #include <list.h>
 #include <string.h>
@@ -7,8 +9,6 @@
 #define MAX_ORDER 10
 
 static free_area_t free_area[MAX_ORDER + 1];
-// extern struct Page *pages;
-// extern size_t npage;
 
 #define free_list(order) (free_area[order].free_list)
 #define nr_free(order)   (free_area[order].nr_free)
