@@ -388,6 +388,28 @@ const struct pmm_manager default_pmm_manager = {
 - ``.nr_free_pages``指定获取nr_free的函数
 - ``.check``用来指定检测函数
 
+
+##### 扩展：le2page的实现过程
+
+```c
+#define le2page(le, member)                 \
+    to_struct((le), struct Page, member)
+```
+
+```c
+#define to_struct(ptr, type, member)                               \
+    ((type *)((char *)(ptr) - offsetof(type, member)))
+```
+
+```c
+#define offsetof(type, member)                                      \
+    ((size_t)(&((type *)0)->member))
+```
+
+注意到，``(type *)0``其实是将一个空指针转化成type*类型，从这里来访问这个结构体的member成员，但实际上这里并不会真的访问内存，只是做一个编译期地址计算，从而获取 member 相对于基地址 0 的偏移量，因为结构体基地址被认为是 0，所以这个值其实就是 member 的偏移。
+
+再到to_struct里边，ptr减去member的偏移量，就得到了ptr指向的member成员的基地址，再强制类型转换，就得到了type*类型，从而获取到了ptr指向的member成员所属的struct的首地址，从而实现了le2page的功能。
+
 ##### 程序在进行物理内存分配的过程
 
 先使用``default_init``来初始化一个双向循环链表存放空闲页，之后使用``default_init_memmap``对某个空闲内存块进行初始化，并放到合适的位置，需要分配内存时使用``default_alloc_pages``，当需要释放内存时使用``default_free_pages``，当然，也可以使用``default_nr_free_pages``获取空闲页的数量。
@@ -598,6 +620,13 @@ qemu pid=2454
   -check_best_fit:                           OK
 Total Score: 25/25
 ```
+
+
+##### 改进空间
+
+- 当前实现的`best_fit_alloc_pages()` 明显需要遍历整个 `free_list`，寻找最合适的空闲块，时间复杂度为` O(k)`（k为空闲块数）。但如果系统空闲块较多，性能会下降明显。可以考虑使用平衡树比如红黑树，或最小堆按`property`块大小组织空闲块，实现`O(log k)`的查找。另外维护多级空闲链表，如后续的`buddy system`的分级思想，减少遍历范围也可以。
+- `Best-Fit`能降低外部碎片，但频繁分配，释放不同大小的页块时，仍可能产生大量细碎的小块，考虑最小合并阈值，当剩余块过小时直接分配出去而非拆分； 
+- 对小规模请求使用`First-Fit`，快速响应，对大块分配使用`Best-Fit`，提高空间利用率。
 
 
 
