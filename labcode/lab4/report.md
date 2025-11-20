@@ -391,6 +391,50 @@ void proc_run(struct proc_struct *proc)
 总结：`proc_run` 的核心就是在一个受保护的、原子的上下文里完成三件事：切页表（确保地址空间正确）、更新 `current`（让系统知道谁在运行）、并调用 `switch_to`（保存/恢复寄存器完成实际的上下文切换）。在设计上需要同时小心中断与地址空间一致性，这些都是操作系统上下文切换的关键细节。
 
 
+经过上述处理，我们运行``make qemu``，得到如下输出：
+
+```c
+Special kernel symbols:
+  entry  0xc020004a (virtual)
+  etext  0xc0203ea0 (virtual)
+  edata  0xc0209030 (virtual)
+  end    0xc020d4ec (virtual)
+Kernel executable memory footprint: 54KB
+memory management: default_pmm_manager
+physcial memory map:
+  memory: 0x08000000, [0x80000000, 0x87ffffff].
+vapaofset is 18446744070488326144
+check_alloc_page() succeeded!
+check_pgdir() succeeded!
+check_boot_pgdir() succeeded!
+use SLOB allocator
+kmalloc_init() succeeded!
+check_vma_struct() succeeded!
+check_vmm() succeeded.
+alloc_proc() correct!
+++ setup timer interrupts
+this initproc, pid = 1, name = "init"
+To U: "Hello world!!".
+To U: "en.., Bye, Bye. :)"
+kernel panic at kern/process/proc.c:407:
+    process exit!!.
+
+Welcome to the kernel debug monitor!!
+Type 'help' for a list of commands.
+```
+
+输入``make grade``，输出内容如下：
+
+```c
+......
+/home/syl/lab/OS/labcode/lab4'
+  -check alloc proc:                         OK
+  -check initproc:                           OK
+Total Score: 30/30
+```
+
+这说明我们的实现是正确的。
+
 ### 扩展练习Challenge
 
 
