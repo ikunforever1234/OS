@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <trap.h>
 #include <vmm.h>
+#include <../libs/sbi.h>
 
 #define TICK_NUM 100
 
@@ -82,6 +83,9 @@ void print_regs(struct pushregs *gpr)
 }
 
 extern struct mm_struct *check_mm_struct;
+static uint64_t count = 0;
+extern void sbi_shutdown(void);
+
 
 void interrupt_handler(struct trapframe *tf)
 {
