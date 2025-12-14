@@ -7,7 +7,7 @@
 
 static inline int
 syscall(int64_t num, ...) {
-    va_list ap;
+    va_list ap;//参数列表
     va_start(ap, num);
     uint64_t a[MAX_ARGS];
     int i, ret;
