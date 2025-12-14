@@ -1915,3 +1915,268 @@ init_memmap(pa2page(mem_begin), (mem_end - mem_begin) / PGSIZE);
 - 我们会把这段占用区域“扣掉”，从下一个页对齐位置开始作为真正可分配的起点，例如 `ROUNDUP(0x80250000, 4KB)`。
 - 再把终点按页对齐向下取整（避免落在半页）。最终得到一个“可分配区间”。
 - `init_memmap` 会把这段区间转换成“按物理地址升序”的空闲页链表。至此，前文的 First‑Fit/Best‑Fit/Buddy 就能直接工作了。
+
+
+### 六、Lab2分支任务：gdb 调试页表查询过程
+
+
+首先我们按照指导书的内容，将原来的``makefile``脚本中的``QEMU``的地址换成我们重新编译过后的路径，之后开启三个终端，分别运行以下命令：
+
+第一个终端T1执行如下，启动我们新编译的调试版``QEMU``，并暂停在初始状态：
+```c
+make debug
+```
+
+第三个终端T3执行如下，启动``gdb``，并连接到``T1``的``QEMU``：
+```c
+make gdb
+```
+
+这里我手动找到了加载页表基址的``satp``的汇编代码的地址为``0x80200034``，因此我们在这里添加断点，并执行：
+
+```c
+(gdb) b *0x80200034
+Breakpoint 1 at 0x80200034
+(gdb) c
+Continuing.
+
+Breakpoint 1, 0x0000000080200034 in ?? ()
+(gdb) delete
+```
+
+执行到这里停下以后，我们删除之前设置的断点，除此之外，因为我们要观察的是虚拟地址被翻译为物理地址的过程，因此我们需要知道一条被确切执行的``load``或者``store``指令，经过一些不可思议的操作（痛苦地单步执行跟踪），我终于找到了一条可爱的``ld``指令 ``ld ra,8(sp)``，他的地址是``0xffffffffc02000c2``，我们在这里添加断点，并执行：
+
+```c
+(gdb) b* 0xffffffffc02000c2
+Breakpoint 2 at 0xffffffffc02000c2: file kern/init/init.c, line 26.
+(gdb) c
+Continuing.
+
+Breakpoint 2, 0xffffffffc02000c2 in print_kerninfo ()
+```
+
+那么此时，我们的程序只要再执行一步，就会进行虚拟地址的翻译了，在这个时候，我们需要在第二个终端``T2``来获取到``qemu``这个进行的``pid``，并使用``gdb``来调试这个``qemu``：
+
+```c
+pgrep -f qemu-system-riscv64
+
+sudo gdb
+```
+
+进入``gdb``调试界面后，在一些可爱的与页表以及虚拟地址翻译的函数名处添加断点（来自gpt的数不清多少次尝试）：
+
+```c
+attach <pid>
+
+b riscv_tr_translate_insn
+
+b cpu_ldl_code
+
+b tlb_index
+
+b tlb_fill
+
+b get_page_addr_code
+
+b cpu_physical_memory_read
+
+b cpu_physical_memory_write
+
+b memory_region_dispatch_read
+
+b memory_region_dispatch_write
+```
+
+然后我们可以查看已经设下的断点，并执行：
+
+```c
+info breakpoints
+
+Num     Type           Disp Enb Address            What
+1       breakpoint     keep y   0x00005621567b4a9c in riscv_tr_translate_insn at /home/syl/qemu-4.1.1/target/riscv/translate.c:796
+2       breakpoint     keep y   0x00005621567a7fa2 in cpu_ldl_code at /home/syl/qemu-4.1.1/include/exec/cpu_ldst_template.h:114
+3       breakpoint     keep y   <MULTIPLE>         
+3.1                         y   0x00005621566fa754 in tlb_index at /home/syl/qemu-4.1.1/include/exec/cpu_ldst.h:166
+3.2                         y   0x00005621567a7e3a in tlb_index at /home/syl/qemu-4.1.1/include/exec/cpu_ldst.h:166
+4       breakpoint     keep y   0x00005621566fcb55 in tlb_fill at /home/syl/qemu-4.1.1/accel/tcg/cputlb.c:871
+5       breakpoint     keep y   0x00005621566fd1a4 in get_page_addr_code at /home/syl/qemu-4.1.1/accel/tcg/cputlb.c:1025
+6       breakpoint     keep y   <MULTIPLE>         
+6.1                         y   0x00005621566d22e4 in cpu_physical_memory_read at /home/syl/qemu-4.1.1/include/exec/cpu-common.h:77
+6.2                         y   0x00005621566d8178 in cpu_physical_memory_read at /home/syl/qemu-4.1.1/include/exec/cpu-common.h:77
+--Type <RET> for more, q to quit, c to continue without paging--c
+6.3                         y   0x00005621567276cb in cpu_physical_memory_read at /home/syl/qemu-4.1.1/include/exec/cpu-common.h:77
+6.4                         y   0x000056215690fb3d in cpu_physical_memory_read at /home/syl/qemu-4.1.1/include/exec/cpu-common.h:77
+7       breakpoint     keep y   <MULTIPLE>         
+7.1                         y   0x00005621566d81a8 in cpu_physical_memory_write at /home/syl/qemu-4.1.1/include/exec/cpu-common.h:82
+7.2                         y   0x000056215690fb6d in cpu_physical_memory_write at /home/syl/qemu-4.1.1/include/exec/cpu-common.h:82
+8       breakpoint     keep y   0x00005621566e70c0 in memory_region_dispatch_read at /home/syl/qemu-4.1.1/memory.c:1447
+9       breakpoint     keep y   0x00005621566e730d in memory_region_dispatch_write at /home/syl/qemu-4.1.1/memory.c:1489
+
+c
+```
+
+回到刚才的``T3``，还记得我们执行到一条``ld``指令，在这里我们继续单步执行：
+
+```c
+si
+```
+
+你可以很轻松的发现它卡住了，因为我们的``T2``触发了断点，``qemu``被中断了，于是我们又回到``T2``，一步一步输入``c``，看看到底会在哪些函数触发断点，just like this：
+
+```c
+[Switching to Thread 0x7f6695fff640 (LWP 20295)]
+
+Thread 3 "qemu-system-ris" hit Breakpoint 5, get_page_addr_code (env=0x562158fb89a0, addr=18446744072637907138) at /home/syl/qemu-4.1.1/accel/tcg/cputlb.c:1025
+1025        uintptr_t mmu_idx = cpu_mmu_index(env, true);
+(gdb) c
+Continuing.
+
+Thread 3 "qemu-system-ris" hit Breakpoint 3, tlb_index (env=0x562158fb89a0, mmu_idx=1, addr=18446744072637907138) at /home/syl/qemu-4.1.1/include/exec/cpu_ldst.h:166
+166         uintptr_t size_mask = env_tlb(env)->f[mmu_idx].mask >> CPU_TLB_ENTRY_BITS;
+(gdb) c
+Continuing.
+
+Thread 3 "qemu-system-ris" hit Breakpoint 3, tlb_index (env=0x562158fb89a0, mmu_idx=1, addr=18446744072637907138) at /home/syl/qemu-4.1.1/include/exec/cpu_ldst.h:166
+166         uintptr_t size_mask = env_tlb(env)->f[mmu_idx].mask >> CPU_TLB_ENTRY_BITS;
+(gdb) c
+Continuing.
+
+Thread 3 "qemu-system-ris" hit Breakpoint 5, get_page_addr_code (env=0x562158fb89a0, addr=18446744072637907138) at /home/syl/qemu-4.1.1/accel/tcg/cputlb.c:1025
+1025        uintptr_t mmu_idx = cpu_mmu_index(env, true);
+(gdb) c
+Continuing.
+
+Thread 3 "qemu-system-ris" hit Breakpoint 3, tlb_index (env=0x562158fb89a0, mmu_idx=1, addr=18446744072637907138) at /home/syl/qemu-4.1.1/include/exec/cpu_ldst.h:166
+166         uintptr_t size_mask = env_tlb(env)->f[mmu_idx].mask >> CPU_TLB_ENTRY_BITS;
+(gdb) c
+Continuing.
+
+Thread 3 "qemu-system-ris" hit Breakpoint 3, tlb_index (env=0x562158fb89a0, mmu_idx=1, addr=18446744072637907138) at /home/syl/qemu-4.1.1/include/exec/cpu_ldst.h:166
+166         uintptr_t size_mask = env_tlb(env)->f[mmu_idx].mask >> CPU_TLB_ENTRY_BITS;
+(gdb) c
+Continuing.
+
+Thread 3 "qemu-system-ris" hit Breakpoint 1, riscv_tr_translate_insn (dcbase=0x7f6695ffe760, cpu=0x562158faff90) at /home/syl/qemu-4.1.1/target/riscv/translate.c:796
+796         DisasContext *ctx = container_of(dcbase, DisasContext, base);
+(gdb) c
+Continuing.
+
+Thread 3 "qemu-system-ris" hit Breakpoint 2, cpu_ldl_code (env=0x562158fb89a0, ptr=18446744072637907138) at /home/syl/qemu-4.1.1/include/exec/cpu_ldst_template.h:114
+114         return glue(glue(glue(cpu_ld, USUFFIX), MEMSUFFIX), _ra)(env, ptr, 0);
+(gdb) c
+Continuing.
+
+Thread 3 "qemu-system-ris" hit Breakpoint 3, tlb_index (env=0x562158fb89a0, mmu_idx=1, addr=18446744072637907138) at /home/syl/qemu-4.1.1/include/exec/cpu_ldst.h:166
+166         uintptr_t size_mask = env_tlb(env)->f[mmu_idx].mask >> CPU_TLB_ENTRY_BITS;
+(gdb) c
+Continuing.
+
+Thread 3 "qemu-system-ris" hit Breakpoint 3, tlb_index (env=0x562158fb89a0, mmu_idx=1, addr=18446744072637907138) at /home/syl/qemu-4.1.1/include/exec/cpu_ldst.h:166
+166         uintptr_t size_mask = env_tlb(env)->f[mmu_idx].mask >> CPU_TLB_ENTRY_BITS;
+(gdb) c
+Continuing.
+
+Thread 3 "qemu-system-ris" hit Breakpoint 3, tlb_index (env=0x562158fb89a0, mmu_idx=1, addr=18446744072637907138) at /home/syl/qemu-4.1.1/include/exec/cpu_ldst.h:166
+166         uintptr_t size_mask = env_tlb(env)->f[mmu_idx].mask >> CPU_TLB_ENTRY_BITS;
+(gdb) c
+Continuing.
+(gdb) 
+```
+
+那么触发的这些函数就是我们要关注的翻译过程了。
+
+这里首先``get_page_addr_code`` 被触发，说明 ``QEMU`` 进入了页表/翻译相关的处理路径，紧接着调用了 ``tlb_index``，这表示 ``QEMU`` 在真正做页表访问前先查询软件 ``TLB``。``tlb_index`` 负责基于地址计算 ``TLB`` 索引并判断是否已有缓存的映射；若命中就可以跳过后续的页表走访，否则会回到翻译流程继续处理，之后第二次``get_page_addr_code`` 被触发，逐级读取页表条目并做有效性检查，从而得到 ``guest`` 的物理页基址或返回访问异常，随后你又观测到多次 ``tlb_index`` 的命中，说明 ``QEMU`` 在页表走访与 ``TLB`` 更新之间来回进行检查，可能读取并解析 ``PTE`` 后会尝试填表并再次确认缓存状态，或在译码/执行不同阶段重复检索。
+
+随后命中 ``riscv_tr_translate_insn``，这表明 ``translator`` 层开始处理指令的取指与译码，触发对指令 ``PC`` 的读取，从而引出接下来的取指访问与相应的地址翻译路径，内部调用了 ``cpu_ldl_code`` ，发起对虚拟地址的读取（取指或数据读取），到这一步 ``QEMU`` 把具体的虚地址提交给 MMU/TLB 处理链，在 ``cpu_ldl_code`` 之后，``tlb_index`` 又被多次命中，显示出从 helper 发起访问到最终完成物理映射之间，``QEMU`` 在不同阶段持续进行 ``TLB`` 检测／填充与验证，最终路径会在 ``TLB`` 命中或页表走访并填表后转入物理内存读写阶段。
+
+整个指令执行过程中囊括了完整的数据流过程``translator → helper → TLB 检查 → 页表走访 → TLB 填充 → 物理访问/返回或异常``。
+
+##### 下面我们来看看页表翻译的过程
+
+页表翻译主要是在这个函数 ``get_page_addr_code`` ，它的源码如下：
+
+```c
+tb_page_addr_t get_page_addr_code(CPUArchState *env, target_ulong addr)
+{
+    uintptr_t mmu_idx = cpu_mmu_index(env, true);
+    uintptr_t index = tlb_index(env, mmu_idx, addr);
+    CPUTLBEntry *entry = tlb_entry(env, mmu_idx, addr);
+    void *p;
+
+    if (unlikely(!tlb_hit(entry->addr_code, addr))) {
+        if (!VICTIM_TLB_HIT(addr_code, addr)) {
+            tlb_fill(env_cpu(env), addr, 0, MMU_INST_FETCH, mmu_idx, 0);
+            index = tlb_index(env, mmu_idx, addr);
+            entry = tlb_entry(env, mmu_idx, addr);
+        }
+        assert(tlb_hit(entry->addr_code, addr));
+    }
+
+    if (unlikely(entry->addr_code & (TLB_RECHECK | TLB_MMIO))) {
+        /*
+         * Return -1 if we can't translate and execute from an entire
+         * page of RAM here, which will cause us to execute by loading
+         * and translating one insn at a time, without caching:
+         *  - TLB_RECHECK: means the MMU protection covers a smaller range
+         *    than a target page, so we must redo the MMU check every insn
+         *  - TLB_MMIO: region is not backed by RAM
+         */
+        return -1;
+    }
+
+    p = (void *)((uintptr_t)addr + entry->addend);
+    return qemu_ram_addr_from_host_nofail(p);
+}
+```
+
+这个函数首先先确定当前访问属于哪个 ``MMU`` 索引，然后用 ``tlb_index``/``tlb_entry`` 找到软件 ``TLB`` 中对应的槽，如果 ``TLB`` 未命中，尝试用 ``VICTIM_TLB_HIT`` 或填表，若映射可直接映射为 ``RAM`` 指针则返回该 ``host`` 指针，否则返回 ``-1`` 。
+
+里面涉及到的``tlb_fill``函数如下：
+
+```c
+static void tlb_fill(CPUState *cpu, target_ulong addr, int size,
+                     MMUAccessType access_type, int mmu_idx, uintptr_t retaddr)
+{
+    CPUClass *cc = CPU_GET_CLASS(cpu);
+    bool ok;
+
+    /*
+     * This is not a probe, so only valid return is success; failure
+     * should result in exception + longjmp to the cpu loop.
+     */
+    ok = cc->tlb_fill(cpu, addr, size, access_type, mmu_idx, false, retaddr);
+    assert(ok);
+}
+```
+它是是负责触发页表翻译和填充 ``TLB`` 的核心函数，调用 ``CPUClass`` 中的架构和CPU特定的 ``tlb_fill`` 实现去完成实际的页表翻译和 ``TLB`` 条目填充，并用 ``assert(ok)`` 确保填充成功。
+
+##### 问题：qemu中模拟出来的tlb和我们真实cpu中的tlb有什么逻辑上的区别？
+
+- 真实的``TLB``是硬件实现，直接嵌入`` CPU ``内部，有特定的并行访问逻辑和替换策略，在更新时硬件自动管理替换，``TLB miss`` 会触发硬件或异常处理机制，由硬件自动完成页表翻译和 ``TLB`` 更新，并返回物理地址。
+
+- QEMU 中的软件 ``TLB`` 是纯软件实现，没有硬件并行处理和替换策略，由软件模拟 ``TLB`` 的行为，访问是通过函数查找，``TLB miss`` 时调用函数去查页表，然后更新模拟的 ``TLB`` 数据结构，并返回物理地址。（这里gpt所说``QEMU``可以灵活模拟，例如标记某些条目为 ``TLB_RECHECK`` 或 ``TLB_MMIO``，表示需要每条指令重新检查或非 ``RAM`` 区域，这在硬件中需要特殊处理。）
+
+<br>
+
+在调试过程中，我第一次能够实际看到，每条 ``load``/``store`` 指令如何触发虚拟地址检查，指令地址如何触发 ``get_page_addr_code()``，``TLB`` 命中与否如何通过软件的 ``tlb_hit() ``体现，``TLB miss`` 后如何调用 ``tlb_fill()``以及页表是如何一步步被遍历的等等，并且也能理解到，``QEMU`` 中的软件 ``TLB`` 是如何模拟硬件 ``TLB`` 的行为，以及如何处理 ``TLB miss`` 和页表访问的。
+
+这里在我阅读指导书，大概搞清楚任务是什么后，我大概询问了gpt应该如何得到翻译过程，以及应该在哪里添加断点，因为函数命名的问题，我在不断试错，询问可能的函数名n次后，终于得到了正确的断点位置，这里附上部分提问提示词：
+
+```
+我现在拥有一套ucore的实验框架，现在我想观察到虚拟地址被翻译到物理地址的具体过程，这个操
+作需要我有一个可调试的qemu，以及开启三个终端，第一个终端执行make debug，第二个终端用来
+找到正在运行的qemu的pid，从而使用gdb来单步调试它，第三个终端用来gdb调试ucore程序，也就
+是说，第二个终端用来调试第三个终端，现在我想找到ucore中某条具体的load或者store指令来观
+察他翻译虚拟地址的过程，我应该在哪些终端打上哪些断点，具体的指令执行顺序是什么，详细地告
+诉我
+
+
+你能否直接告诉我T2应该在哪些函数打断点，因为我的grep输出什么也没有
+
+
+ok我现在的情况是，我的T3已经在一条sd指令处停止，只要执行si就执行这条指令。
+T2建立了上面说的那些断点，但是还没有continue，那么我接下来应该怎样继续执行
+能观察到虚拟地址翻译的过程，请告诉我每一个终端要操作的指令和顺序
+```
+
+
