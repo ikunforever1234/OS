@@ -383,8 +383,6 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
     // 8. 成为 RUNNABLE
     wakeup_proc(proc);
 
-    nr_process++;
-
     ret = proc->pid;
 
     
