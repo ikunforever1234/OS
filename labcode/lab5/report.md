@@ -123,7 +123,7 @@
     ```
 <br>
 
-### 二、练习1：加载应用程序并执行
+### 二、练习1：加载应用程序并执行 （苏耀磊 2311727）
 
 这里我们需要补充``load_icode``的第6步，建立相应的用户内存空间来放置应用程序的代码段、数据段等，且要设置好``proc_struct``结构中的成员变量``trapframe``中的内容，确保在执行此进程后，能够从应用程序设定的起始执行地址开始执行。
 
@@ -298,7 +298,7 @@
         sret
     ```
 
-### 三、练习2: 父进程复制自己的内存空间给子进程
+### 三、练习2: 父进程复制自己的内存空间给子进程（郭思达 2310688）
 
 #### 1.`copy_range`的设计实现过程
 
@@ -448,7 +448,7 @@ ret = page_insert(to, npage, start, perm | PTE_V);
 通过这种方式，系统实现了“写时复制”，在保证进程隔离性的同时提高了整体性能。
 
 
-### 四、练习3：fork/exec/wait/exit 的实现分析
+### 四、练习3：fork/exec/wait/exit 的实现分析 （吴行健 2310686）
 
 1) 执行流程概述
 
@@ -527,8 +527,54 @@ ret = page_insert(to, npage, start, perm | PTE_V);
     - `kern/mm/pmm.c`（`copy_range`、页表/页操作）
 
 
+<br>
 
-### 五、扩展练习 Challenge
+完成上面的内容后，我们执行``make grade``，得到以下结果，说明实验验证成功。
+
+```c
+badsegment:              (1.0s)
+  -check result:                             OK
+  -check output:                             OK
+divzero:                 (1.0s)
+  -check result:                             OK
+  -check output:                             OK
+softint:                 (1.0s)
+  -check result:                             OK
+  -check output:                             OK
+faultread:               (91.1s)
+  -check result:                             OK
+  -check output:                             OK
+faultreadkernel:         (91.0s)
+  -check result:                             OK
+  -check output:                             OK
+hello:                   (1.0s)
+  -check result:                             OK
+  -check output:                             OK
+testbss:                 (91.1s)
+  -check result:                             OK
+  -check output:                             OK
+pgdir:                   (1.0s)
+  -check result:                             OK
+  -check output:                             OK
+yield:                   (1.0s)
+  -check result:                             OK
+  -check output:                             OK
+badarg:                  (1.0s)
+  -check result:                             OK
+  -check output:                             OK
+exit:                    (1.0s)
+  -check result:                             OK
+  -check output:                             OK
+spin:                    (4.0s)
+  -check result:                             OK
+  -check output:                             OK
+forktest:                (1.0s)
+  -check result:                             OK
+  -check output:                             OK
+Total Score: 130/130
+```
+
+### 五、扩展练习 Challenge （吴行健 2310686）
 #### 1.COW
 核心思路是在 fork 阶段仅复制页表，而不复制实际的物理内存页，父子进程最初共享同一组物理页，并将这些页在页表中标记为只读。
 
@@ -605,7 +651,7 @@ execve 时仅建立虚拟地址空间布局，读取 ELF 头与程序头表，�
 
 - ucore 采用的一次性加载方式简化了内存管理，适合教学与嵌入式环境；而懒加载机制更适合通用操作系统，能显著提升系统整体性能与资源利用率。两种方式各有优劣，选择哪种取决于具体的应用场景和设计目标。
 
-### 六、Lab2分支任务：gdb 调试页表查询过程
+### 六、Lab2分支任务：gdb 调试页表查询过程 （苏耀磊 2311727）
 
 
 首先我们按照指导书的内容，将原来的``makefile``脚本中的``QEMU``的地址换成我们重新编译过后的路径，之后开启三个终端，分别运行以下命令：
@@ -867,7 +913,7 @@ T2建立了上面说的那些断点，但是还没有continue，那么我接下�
 能观察到虚拟地址翻译的过程，请告诉我每一个终端要操作的指令和顺序
 ```
 
-### 七、lab5分支任务：gdb 调试系统调用以及返回
+### 七、lab5分支任务：gdb 调试系统调用以及返回 （郭思达 2310688）
 
 这一次调试主要是为了使用同一套方案来观察操作系统中一个至关重要的机制——**系统调用的完整流程**。
 
@@ -968,6 +1014,50 @@ GDB 显示结果如下:
 ```
 这样，PU 根据 stvec 寄存器自动跳转到内核 trap 入口，特权级从 U-mode → S-mode，开始保存用户态寄存器上下文（SAVE_ALL），该过程由 QEMU 模拟硬件行为完成。
 
+
+而在`sudo gdb riscv64-softmmu/qemu-system-riscv64`中观察到以下情况(即终端三)：
+ 
+- 执行到ecall时，qemu输入continue命令后，会经过一段时间自动退出。QEMU 里被调试的内核，即用户程序直接执行完了导致退出。
+
+- 同样在ecall后，可以看寄存器状态：
+
+```
+(gdb) info registers
+rax            0xfffffffffffffdfe  -514
+rbx            0x0                 0
+rcx            0x794b6b718d3e      133364832111934
+rdx            0x7fff4c790160      140734476386656
+rsi            0x6                 6
+rdi            0x584619034eb0      97058090602160
+rbp            0x7fff4c7901e0      0x7fff4c7901e0
+rsp            0x7fff4c790140      0x7fff4c790140
+r8             0x8                 8
+r9             0x0                 0
+r10            0x0                 0
+r11            0x293               659
+r12            0x7fff4c7905a8      140734476387752
+r13            0x7fff4c790160      140734476386656
+r14            0x584617b6ac18      97058068802584
+r15            0x794b6bcf7040      133364838264896
+rip            0x794b6b718d3e      0x794b6b718d3e <__ppoll+174>
+eflags         0x293               [ CF AF SF IF ]
+cs             0x33                51
+ss             0x2b                43
+ds             0x0                 0
+es             0x0                 0
+fs             0x0                 0
+gs             0x0                 0
+k0             0x10                16
+k1             0x0                 0
+k2             0xff7ff7ff          4286576639
+k3             0x0                 0
+k4             0x0                 0
+k5             0x0                 0
+k6             0x0                 0
+k7             0x0                 0
+```
+
+但是看到的都是宿主的寄存器。
 5. 继续内核 GDB 调试，在成功地使 QEMU 停在 ecall 时，切回 内核 GDB，如上所示。
 
 接下来在trapentry.S处的133行，sret指令处打上断点：
@@ -1108,6 +1198,15 @@ riscv64-softmmu/qemu-system-riscv64: ELF 64-bit LSB pie executable, x86-64, vers
 Breakpoint 2, syscall (num=2) at user/libs/syscall.c:19 19 asm volatile ( (gdb) si Warning: Cannot insert breakpoint 1: Cannot access memory at address 0xffffffffc0200000 Command aborted. (gdb) break user/libs/syscall.c:18 Note: breakpoint 2 also set at pc 0x8000f8. Breakpoint 3 at 0x8000f8: file user/libs/syscall.c, line 19. (gdb) si Warning: Cannot insert breakpoint 1: Cannot access memory at address 0xffffffffc0200000 Command aborted
 ```
 
+<br>
 
+### 八、总结
+
+
+在本次实验中，存在一些与理论课不同的内容，首先用户态通过 ecall/ebreak 进入内核，保存寄存器，内核执行后再恢复返回，而理论课中，我们也了解到系统调用是用户态安全进入内核态的唯一正规入口，除此之外，在本次实验中，通过 sscratch 在中断时切换用户栈和内核栈，而原理课中特权级切换必须使用独立内核栈，防止用户破坏内核。
+
+我认为，本次实验的重点是fork 系统调用通过复制当前进程的 PCB 和页表，创建了一个新的子进程。父进程与子进程通过返回值区分，父进程得到子进程的 PID，子进程则得到 0，从而在不同路径中执行各自的任务。exec 系统调用则是将当前进程的地址空间替换为一个新的程序，加载新的 ELF 格式程序并重新设置进程的栈与 trapframe，完成了进程内容的更换，但进程 ID 保持不变。
+
+总的来说，本实验详细地展现了用户程序是如何被完整地执行的，向我们展示了操作系统如何管理和调度进程、内存以及如何在用户与内核之间进行有效的交互，这些知识让我们在对操作系统底层的认识上有了更深入的理解。
 
 

@@ -129,7 +129,7 @@ void interrupt_handler(struct trapframe *tf)
          * (4)判断打印次数，当打印次数为10时，调用<sbi.h>中的关机函数关机
          */
 
-         /* LAB5 GRADE   YOUR CODE :  */
+         /* LAB5 GRADE  苏耀磊 2311727 :  */
         /* 时间片轮转： 
         *(1) 设置下一次时钟中断（clock_set_next_event）
         *(2) ticks 计数器自增

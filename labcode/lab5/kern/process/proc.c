@@ -119,7 +119,7 @@ alloc_proc(void)
         proc->flags = 0;
         memset(proc->name, 0, sizeof(proc->name));
 
-        // LAB5 YOUR CODE : (update LAB4 steps)
+        // LAB5 苏耀磊 2311727 : (update LAB4 steps)
         /*
          * below fields(add in LAB5) in proc_struct need to be initialized
          *       uint32_t wait_state;                        // waiting state
@@ -503,7 +503,6 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
     // list_add(&proc_list, &(proc->list_link));
     hash_proc(proc);
 
-    // LAB5 update step5: 统一用 set_links 来处理插入与关系设置
     set_links(proc);  // set_links 应负责把 proc 插入 proc_list/hash 并把它挂到 parent 的 child list
 
     // 8. 成为 RUNNABLE
@@ -514,7 +513,7 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
     ret = proc->pid;
 
 
-    // LAB5 YOUR CODE : (update LAB4 steps)
+    // LAB5 苏耀磊 2311727 : (update LAB4 steps)
     // TIPS: you should modify your written code in lab4(step1 and step5), not add more code.
     /* Some Functions
      *    set_links:  set the relation links of process.  ALSO SEE: remove_links:  lean the relation links of process
@@ -774,7 +773,7 @@ load_icode(unsigned char *binary, size_t size)
     // Keep sstatus
     uintptr_t sstatus = tf->status;
     memset(tf, 0, sizeof(struct trapframe));
-    /* LAB5:EXERCISE1 YOUR CODE
+    /* LAB5:EXERCISE1 苏耀磊 2311727
      * should set tf->gpr.sp, tf->epc, tf->status
      * NOTICE: If we set trapframe correctly, then the user level process can return to USER MODE from kernel. So
      *          tf->gpr.sp should be user stack top (the value of sp)
