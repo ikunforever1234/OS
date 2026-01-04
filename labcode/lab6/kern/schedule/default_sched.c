@@ -17,7 +17,9 @@
 static void
 RR_init(struct run_queue *rq)
 {
-    // LAB6: YOUR CODE
+    // LAB6: 2311727 苏耀磊
+    list_init(&(rq->run_list));  // 初始化运行队列为空链表
+    rq->proc_num = 0;             // 初始化进程数量为0
 }
 
 /*
@@ -34,7 +36,14 @@ RR_init(struct run_queue *rq)
 static void
 RR_enqueue(struct run_queue *rq, struct proc_struct *proc)
 {
-    // LAB6: YOUR CODE
+    // LAB6: 2311727 苏耀磊
+    assert(list_empty(&(proc->run_link)));      // 确保进程不在任何队列中
+    list_add_before(&(rq->run_list), &(proc->run_link));  // 将进程插入队列尾部
+    if (proc->time_slice == 0 || proc->time_slice > rq->max_time_slice) {
+        proc->time_slice = rq->max_time_slice;  // 分配时间片
+    }
+    proc->rq = rq;                              // 设置进程所属的运行队列
+    rq->proc_num ++;                            // 队列中进程数量加1
 }
 
 /*
@@ -47,7 +56,10 @@ RR_enqueue(struct run_queue *rq, struct proc_struct *proc)
 static void
 RR_dequeue(struct run_queue *rq, struct proc_struct *proc)
 {
-    // LAB6: YOUR CODE
+    // LAB6: 2311727 苏耀磊
+    assert(!list_empty(&(proc->run_link)) && proc->rq == rq);  // 确保进程在该队列中
+    list_del_init(&(proc->run_link));           // 从队列中删除并重新初始化链表节点
+    rq->proc_num --;                            // 队列中进程数量减1
 }
 
 /*
@@ -61,7 +73,13 @@ RR_dequeue(struct run_queue *rq, struct proc_struct *proc)
 static struct proc_struct *
 RR_pick_next(struct run_queue *rq)
 {
-    // LAB6: YOUR CODE
+    // LAB6: 2311727 苏耀磊
+    if (list_empty(&(rq->run_list))) {          // 如果队列为空
+        return NULL;                            // 返回NULL
+    }
+    list_entry_t *le = list_next(&(rq->run_list));  // 获取队列头部的链表节点
+    struct proc_struct *p = le2proc(le, run_link);  // 通过链表节点获取进程指针
+    return p;                                   // 返回选中的进程
 }
 
 /*
@@ -74,7 +92,13 @@ RR_pick_next(struct run_queue *rq)
 static void
 RR_proc_tick(struct run_queue *rq, struct proc_struct *proc)
 {
-    // LAB6: YOUR CODE
+    // LAB6: 2311727 苏耀磊
+    if (proc->time_slice > 0) {                 // 如果进程还有剩余时间片
+        proc->time_slice --;                    // 时间片减1
+    }
+    if (proc->time_slice == 0) {                // 如果时间片用完
+        proc->need_resched = 1;                 // 设置需要调度标志
+    }
 }
 
 struct sched_class default_sched_class = {

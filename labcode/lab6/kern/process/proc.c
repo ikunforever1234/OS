@@ -106,6 +106,20 @@ alloc_proc(void)
          *       char name[PROC_NAME_LEN + 1];               // Process name
          */
 
+
+        proc->state = PROC_UNINIT;
+        proc->pid = -1;
+        proc->runs = 0;
+        proc->kstack = 0;
+        proc->need_resched = 0;
+        proc->parent = NULL;
+        proc->mm = NULL;
+        memset(&proc->context, 0, sizeof(struct context));
+        proc->tf = NULL;
+        proc->pgdir = boot_pgdir_pa;
+        proc->flags = 0;
+        memset(proc->name, 0, sizeof(proc->name));
+
         // LAB5:填写你在lab5中实现的代码 (update LAB4 steps)
         /*
          * below fields(add in LAB5) in proc_struct need to be initialized
@@ -113,7 +127,12 @@ alloc_proc(void)
          *       struct proc_struct *cptr, *yptr, *optr;     // relations between processes
          */
 
-        // LAB6:YOUR CODE (update LAB5 steps)
+        proc->wait_state = 0;   /* not waiting */
+        proc->cptr = NULL;      /* first child */
+        proc->yptr = NULL;      /* younger sibling */
+        proc->optr = NULL;      /* older sibling */
+
+        // LAB6:2311727 苏耀磊 (update LAB5 steps)
         /*
          * below fields(add in LAB6) in proc_struct need to be initialized
          *       struct run_queue *rq;                       // run queue contains Process
@@ -123,6 +142,14 @@ alloc_proc(void)
          *       uint32_t lab6_stride;                       // stride value (lab6 stride)
          *       uint32_t lab6_priority;                     // priority value (lab6 stride)
          */
+
+
+        proc->rq = NULL;                        // 进程还未加入任何运行队列
+        list_init(&(proc->run_link));          // 初始化运行队列链表节点
+        proc->time_slice = 0;                   // 初始时间片为0
+        proc->lab6_run_pool.left = proc->lab6_run_pool.right = proc->lab6_run_pool.parent = NULL;  // 初始化斜堆节点
+        proc->lab6_stride = 0;                  // stride值初始化为0
+        proc->lab6_priority = 0;                // 优先级初始化为0（默认优先级）
     }
     return proc;
 }
@@ -236,6 +263,26 @@ void proc_run(struct proc_struct *proc)
          *   lsatp():                   Modify the value of satp register
          *   switch_to():              Context switching between two processes
          */
+
+        struct proc_struct *prev = current;
+        bool intr_flag;
+
+        /* 保存并关闭本地中断，保证下面的切换操作是原子的 */
+        local_intr_save(intr_flag);
+
+        /* 切换页表到将要运行进程的 pgdir*/
+        lsatp(proc->pgdir);
+
+        /* 更新调度器状态：current 指向新的进程，统计运行次数 */
+        current = proc;
+        proc->runs++;
+        proc->need_resched = 0;
+
+        /* 把 prev 的寄存器保存到 prev->context，并把 proc 的 context 恢复到寄存器中。 */
+        switch_to(&prev->context, &proc->context);
+
+        /* 在新进程上下文中恢复中断使能为切换前的状态 */
+        local_intr_restore(intr_flag);
     }
 }
 
@@ -452,6 +499,45 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
      *    update step 1: set child proc's parent to current process, make sure current process's wait_state is 0
      *    update step 5: insert proc_struct into hash_list && proc_list, set the relation links of process
      */
+
+    // 1. 分配 PCB
+    if ((proc = alloc_proc()) == NULL)
+        goto fork_out;
+
+    //  设置父子关系（child->parent = current）并确保 current 的 wait_state 为 0
+    proc->parent = current;
+    current->wait_state = 0;
+    
+    // 2. 分配内核栈
+    if (setup_kstack(proc) != 0)
+        goto bad_fork_cleanup_proc;
+
+    // 3. 复制 mm 信息（内核线程不用处理）
+    if (copy_mm(clone_flags, proc) != 0)
+        goto bad_fork_cleanup_kstack;
+
+    // 4. 设置 trapframe & context
+    copy_thread(proc, stack, tf);
+
+    // 5. 分配唯一 PID
+    proc->pid = get_pid();
+
+    // // 6. 设置父进程
+    // proc->parent = current;
+
+    // // 7. 加入进程哈希表 & 全局链表
+    // list_add(&proc_list, &(proc->list_link));
+    hash_proc(proc);
+
+    set_links(proc);  // set_links 应负责把 proc 插入 proc_list/hash 并把它挂到 parent 的 child list
+
+    // 8. 成为 RUNNABLE
+    wakeup_proc(proc);
+
+    // nr_process++;
+
+    ret = proc->pid;
+    
 
 fork_out:
     return ret;
@@ -688,6 +774,15 @@ load_icode(unsigned char *binary, size_t size)
      *          tf_eip should be the entry point of this binary program (elf->e_entry)
      *          tf_eflags should be set to enable computer to produce Interrupt
      */
+
+    
+    tf->gpr.sp = USTACKTOP;//设置用户栈指针
+
+    tf->epc = elf->e_entry;//设置程序入口地址
+
+    // tf->status = sstatus & ~(SSTATUS_SPP | SSTATUS_SPIE);
+    tf->status = (sstatus & ~SSTATUS_SPP) | SSTATUS_SPIE;
+    //清除 SPP 位，设置 SPIE 位，以确保从内核态返回时进入用户态，并且保证中断被启用
 
     ret = 0;
 out:

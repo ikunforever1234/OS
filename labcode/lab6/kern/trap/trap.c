@@ -94,6 +94,8 @@ void print_regs(struct pushregs *gpr)
 }
 
 extern struct mm_struct *check_mm_struct;
+static uint64_t count = 0;
+extern void sbi_shutdown(void);
 
 void interrupt_handler(struct trapframe *tf)
 {
@@ -129,9 +131,25 @@ void interrupt_handler(struct trapframe *tf)
          * (4)判断打印次数，当打印次数为10时，调用<sbi.h>中的关机函数关机
          */
 
-        // lab6: YOUR CODE  (update LAB3 steps)
+        // 1) 安排下一次时钟中断（尽早调用以避免遗漏）
+        clock_set_next_event();
+
+        // 2) 更新全局 ticks（单核可以直接操作）
+        ticks++;
+
+        // 3) 每 TICK_NUM 次中断触发一次时间片检查
+        if (ticks % TICK_NUM == 0) {
+            if (current != NULL) {
+                // 标记当前进程需要被重新调度
+                current->need_resched = 1;
+            }
+        }
+
+        // lab6: 2311727 苏耀磊  (update LAB3 steps)
         //  在时钟中断时调用调度器的 sched_class_proc_tick 函数
 
+        sched_class_proc_tick(current);
+        
         break;
     case IRQ_H_TIMER:
         cprintf("Hypervisor software interrupt\n");
